@@ -1,0 +1,89 @@
+Outlier Report - Mode: both - Total: 27
+============================================================
+Threshold: Action joint dims exceed ±π (3.1416)
+Delete mode: ON
+
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode148.hdf5 -> Dims: [2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode73.hdf5 -> Dims: [2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode156.hdf5 -> Dims: [9, 12]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode6.hdf5 -> Dims: [12]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode64.hdf5 -> Dims: [7, 9]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_clean/data/episode43.hdf5 -> Dims: [9]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode46.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode91.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode170.hdf5 -> Dims: [9]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode148.hdf5 -> Dims: [12]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode44.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode1.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode136.hdf5 -> Dims: [0]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode54.hdf5 -> Dims: [8, 9]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode5.hdf5 -> Dims: [1, 2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode193.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode23.hdf5 -> Dims: [5]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode174.hdf5 -> Dims: [9]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode60.hdf5 -> Dims: [12]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_clean/data/episode39.hdf5 -> Dims: [7]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode177.hdf5 -> Dims: [0, 2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode13.hdf5 -> Dims: [2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode138.hdf5 -> Dims: [7]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode158.hdf5 -> Dims: [12]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode121.hdf5 -> Dims: [1, 2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode118.hdf5 -> Dims: [1, 2]
+[Action] /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode61.hdf5 -> Dims: [8, 9]
+
+============================================================
+DELETED FILES (54):
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode148.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/instructions/episode148.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode73.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/instructions/episode73.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode156.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/instructions/episode156.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode6.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/instructions/episode6.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/data/episode64.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/hanging_mug/demo_randomized/instructions/episode64.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_clean/data/episode43.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_clean/instructions/episode43.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode46.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode46.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode91.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode91.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode170.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode170.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode148.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode148.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode44.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode44.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode1.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode1.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode136.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode136.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode54.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode54.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode5.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode5.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode193.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode193.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode23.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode23.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode174.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode174.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/data/episode60.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/press_stapler/demo_randomized/instructions/episode60.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_clean/data/episode39.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_clean/instructions/episode39.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode177.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/instructions/episode177.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode13.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/instructions/episode13.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode138.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/instructions/episode138.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/data/episode158.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/scan_object/demo_randomized/instructions/episode158.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode121.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/instructions/episode121.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode118.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/instructions/episode118.json
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/data/episode61.hdf5
+  /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10/stamp_seal/demo_randomized/instructions/episode61.json

@@ -1,0 +1,63 @@
+{
+  "dino_checkpoint": "/home/yf/Desktop/Code/VLA/DINOV3_HDF5-Myself/dinov3_pretrain/dinov3-vitl16-pretrain-lvd1689m",
+  "hidden_size": 1024,
+  "image_size": [
+    320,
+    240
+  ],
+  "data_mode": "both",
+  "camera_name": "head_camera",
+  "feature": "last_layer_cls_diff (last_frame - first_frame), averaged per task",
+  "tasks": {
+    "adjust_bottle": {
+      "num_episodes": 248,
+      "dim": 1024,
+      "norm": 6.675294399261475
+    },
+    "grab_roller": {
+      "num_episodes": 208,
+      "dim": 1024,
+      "norm": 11.917343139648438
+    },
+    "hanging_mug": {
+      "num_episodes": 245,
+      "dim": 1024,
+      "norm": 5.500355243682861
+    },
+    "move_stapler_pad": {
+      "num_episodes": 249,
+      "dim": 1024,
+      "norm": 6.889362812042236
+    },
+    "open_microwave": {
+      "num_episodes": 250,
+      "dim": 1024,
+      "norm": 7.622282981872559
+    },
+    "press_stapler": {
+      "num_episodes": 233,
+      "dim": 1024,
+      "norm": 8.32447624206543
+    },
+    "scan_object": {
+      "num_episodes": 245,
+      "dim": 1024,
+      "norm": 8.52569580078125
+    },
+    "stack_blocks_two": {
+      "num_episodes": 250,
+      "dim": 1024,
+      "norm": 11.313125610351562
+    },
+    "stamp_seal": {
+      "num_episodes": 246,
+      "dim": 1024,
+      "norm": 6.539563179016113
+    },
+    "turn_switch": {
+      "num_episodes": 242,
+      "dim": 1024,
+      "norm": 8.711689949035645
+    }
+  }
+}
