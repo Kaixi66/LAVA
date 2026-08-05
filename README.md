@@ -24,6 +24,14 @@ Key features:
   Bubble size denotes the number of parameters.</em>
 </p>
 
+
+<p align="center">
+  <img src="assets/FrameWork.png" width="95%"/>
+</p>
+<p align="center">
+  <em>LiLa-WAM Framework.</em>
+</p>
+
 ## Installation
 
 
