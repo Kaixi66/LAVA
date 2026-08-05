@@ -15,6 +15,15 @@ Key features:
 - 🎯 **Visual Transition Tokens (VTT)**
 - 🤖 **Evaluated on**: RoboTwin 2.0 (50 tasks), LIBERO, and real-robot experiments
 
+<p align="center">
+  <img src="assets/compare_robotwin.png" width="48%"/>
+  <img src="assets/compare_libero.png" width="48%"/>
+</p>
+<p align="center">
+  <em>Success rate vs. model parameters on RoboTwin 2.0 (left) and LIBERO (right).
+  Bubble size denotes the number of trainable parameters.</em>
+</p>
+
 ## Installation
 
 
