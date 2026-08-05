@@ -2,7 +2,7 @@
 
 Official implementation of **LiLa-WAM**, a lightweight world-action model that is trainable on a **single consumer-grade GPU (24 GB)**.
 
-&gt; 📄 Paper: [arXiv](https://arxiv.org/abs/XXXX.XXXXX).
+&gt; 📄 Paper: [arXiv](https://arxiv.org/pdf/2608.03701).
 
 ## Overview
 
@@ -71,6 +71,7 @@ If you find this work useful, please consider citing:
 ```bibtex
 @article{lilawam2026,
   title={LiLa-WAM: Lightweight Latent Reasoning World-Action Model for Robot Manipulation},
+  journal={https://arxiv.org/pdf/2608.03701},
   year={2026}
 }
 ```
