@@ -2,7 +2,7 @@
 
 Official implementation of **LiLa-WAM**, a lightweight world-action model that is trainable on a **single consumer-grade GPU (24 GB)**.
 
-&gt; 📄 Paper: [arXiv](https://arxiv.org/pdf/2608.03701).
+&gt; 📄 Paper: [arXiv](https://arxiv.org/pdf/2608.03701). | 🌐 Project Page: [teee000.github.io/LiLa-WAM-page](https://teee000.github.io/LiLa-WAM-page/)
 
 ## Overview
 
