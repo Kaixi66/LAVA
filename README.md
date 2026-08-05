@@ -21,7 +21,7 @@ Key features:
 </p>
 <p align="center">
   <em>Success rate vs. model parameters on RoboTwin 2.0 (left) and LIBERO (right).
-  Bubble size denotes the number of trainable parameters.</em>
+  Bubble size denotes the number of parameters.</em>
 </p>
 
 ## Installation
