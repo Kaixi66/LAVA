@@ -86,6 +86,9 @@ Before training or evaluation, update the following paths in the configuration f
 | `task_cond_dir` | Path to the VTT embedding files |
 | `model.vision_encoder.checkpoint_path` | Path to the pretrained DINOv3 checkpoint |
 
+## Evaluation on RoboTwin 2.0
+
+**Please refer to [README_EVAL.md](README_EVAL.md) for detailed evaluation instructions**.
 
 ## Checkpoints
 
