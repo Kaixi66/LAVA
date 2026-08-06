@@ -94,6 +94,7 @@ Before training or evaluation, update the following paths in the configuration f
 
 Pre-trained weights on RoboTwin 2.0 (50 tasks) are available on ModelScope:
 [ModelScope](https://www.modelscope.cn/models/yangfan97/LiLa-WAM_RoboTwin2_0)
+[Google Drive](https://drive.google.com/drive/folders/15usxTjIyOTC4Fu2VNVoZ03efptM1mNFa?usp=drive_link)
 
 ## Citation
 
