@@ -66,6 +66,16 @@ LiLa-WAM uses the frozen **DINOv3 ViT-L/16** encoder:
 
 - Model: `dinov3-vitl16-pretrain-lvd1689m`
 
+- **`utils/clean_dataset_stationary.py`**
+  Removes stationary segments (steps where the robot barely moves) from raw demonstrations.
+
+### Normalization Statistics
+
+- **`utils/calc_stat_remove_outlier.py`**
+  Computes normalization statistics (mean / std) over the training dataset with outlier removal.
+- **`utils/stat-500-all.json`**
+  Pre-computed normalization statistics covering all 50 tasks, so you can start training directly without re-computing them.
+
 ## Configuration
 
 Before training or evaluation, update the following paths in the configuration files under `configs/`:
