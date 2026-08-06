@@ -89,7 +89,8 @@ Before training or evaluation, update the following paths in the configuration f
 
 ## Checkpoints
 
-Checkpoints will be released soon.
+Pre-trained weights on RoboTwin 2.0 (50 tasks) are available on ModelScope:
+[ModelScope](https://www.modelscope.cn/models/yangfan97/LiLa-WAM_RoboTwin2_0)
 
 ## Citation
 
