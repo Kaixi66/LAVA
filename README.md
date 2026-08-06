@@ -72,7 +72,7 @@ LiLa-WAM uses the frozen **DINOv3 ViT-L/16** encoder:
 ### Normalization Statistics
 
 - **`utils/calc_stat_remove_outlier.py`**
-  Computes normalization statistics (mean / std) over the training dataset with outlier removal.
+  Computes normalization statistics over the training dataset with outlier removal.
 - **`utils/stat-500-all.json`**
   Pre-computed normalization statistics covering all 50 tasks, so you can start training directly without re-computing them.
 
