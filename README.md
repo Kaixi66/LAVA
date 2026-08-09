@@ -101,9 +101,10 @@ Pre-trained weights on RoboTwin 2.0 (50 tasks) are available on ModelScope:
 If you find this work useful, please consider citing:
 
 ```bibtex
-@article{lilawam2026,
-  title={LiLa-WAM: Lightweight Latent Reasoning World-Action Model for Robot Manipulation},
-  journal={https://arxiv.org/pdf/2608.03701},
+@article{yang2026lila,
+  title={LiLa-WAM: Lightweight Latent Reasoning World-Action Model for Robotic Manipulation},
+  author={Yang, Fan and Su, Yuting and Wang, Xiaobo and You, Yuncheng and Fan, Fugui and Wu, Yuting and Wu, Minghui and Zhao, Chenxu and Ning, JiaHong and Jing, Peiguang},
+  journal={arXiv preprint arXiv:2608.03701},
   year={2026}
 }
 ```
