@@ -58,17 +58,30 @@ def build_train_config_from_yaml(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VLA Training Script (DINOv3)")
+    parser = argparse.ArgumentParser(description="VLA Training Script (DINOv3) - two-stage LR version")
     parser.add_argument("--config", type=str, default="./configs/robotwin_all.yaml",
                         help="Path to config file")
-    parser.add_argument("--norm_stats_path", type=str, default="./utils/stat-500-all.json",
+    parser.add_argument("--norm_stats_path", type=str, 
+                        default="./utils/stat-500-all.json",
                         help="Path to normalization stats")
     parser.add_argument("--save_dir", type=str, default="./checkpoints_vla",
                         help="Directory to save checkpoints")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume training from "
-                             "(restores model + optimizer + scheduler + epoch)")
+                        help="Path to checkpoint to resume training from after an interruption "
+                             "(restores model + optimizer + scheduler + epoch, continues the "
+                             "lr schedule saved in the checkpoint)")
+    parser.add_argument("--init_from", type=str,
+                        default=None,
+                        help="Path to checkpoint to initialize model weights from "
+                             "Only model weights "
+                             "are loaded; optimizer and lr scheduler start fresh from --config. "
+                             "Mutually exclusive with --resume.")
     args = parser.parse_args()
+
+    if args.resume and args.init_from:
+        raise ValueError("--resume and --init_from are mutually exclusive: "
+                         "--resume continues an interrupted run (inherits its lr schedule), "
+                         "--init_from starts a new stage with a fresh lr schedule.")
 
     # =========================================================================
     # 1. Environment / Config
@@ -88,8 +101,14 @@ if __name__ == "__main__":
     lr = config.training.learning_rate
     lr_min = config.training.lr_min
 
+    if lr_min > lr:
+        logger.warning(f"lr_min ({lr_min}) > learning_rate ({lr}): "
+                       f"CosineAnnealingLR will RAISE the lr towards lr_min instead of decaying. "
+                       f"Check your config.")
+
     logger.info(f"Epochs: {epochs} | Batch: {batch_size} | "
                 f"grad_accum: {grad_accum_steps} | save_every: {save_interval_epoch} ep")
+    logger.info(f"LR schedule: CosineAnnealingLR {lr:.2e} -> {lr_min:.2e}")
     logger.info(f"DINOv3 feat_layers: {list(config.model.vision_encoder.feat_layers)} | "
                 f"include_cls_register: {config.model.vision_encoder.include_cls_register}")
     logger.info(f"Vel-Weight: {'ENABLED' if config.training.use_vel_weight else 'DISABLED'}")
@@ -182,10 +201,25 @@ if __name__ == "__main__":
     )
 
     # =========================================================================
-    # 5. Resume
+    # 5. Load checkpoint: --init_from (new stage) or --resume (interrupted run)
     # =========================================================================
     start_epoch = 0
     global_step = 0
+
+    if args.init_from:
+        # New training stage (e.g. stage-2 low-lr phase): load ONLY model weights.
+        # Optimizer/scheduler stay fresh so the lr schedule restarts from --config.
+        if not os.path.exists(args.init_from):
+            raise FileNotFoundError(f"Init checkpoint not found: {args.init_from}")
+
+        logger.info(f">>> Initializing weights from {args.init_from} "
+                    f"(fresh optimizer + lr schedule from config)")
+        ckpt = torch.load(args.init_from, map_location='cpu', weights_only=False)
+
+        msg = action_model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        logger.info(f"Model loaded (init_from epoch={ckpt.get('epoch', '?')}). "
+                    f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
+        logger.info(f"Starting new stage: lr={lr:.2e} -> {lr_min:.2e}, epochs={epochs}")
 
     if args.resume:
         if not os.path.exists(args.resume):
