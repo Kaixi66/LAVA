@@ -84,6 +84,30 @@ Before training or evaluation, update the following paths in the configuration f
 | `task_cond_dir` | Path to the VTT embedding files |
 | `model.vision_encoder.checkpoint_path` | Path to the pretrained DINOv3 checkpoint |
 
+
+## Training Details (Two-Stage Learning Rate Schedule)
+
+The default config (`configs/robotwin_all.yaml`) sets a total of **40 epochs** with a learning rate of **2e-4**. In practice, however, you do **not** need to train for all 40 epochs. We recommend a two-stage schedule:
+
+**Stage 1 — Base training (LR = 2e-4):** Train for about **11–12 epochs**, then stop early. There is no need to complete the full 40 epochs.
+
+```bash
+python train.py --config ./configs/robotwin_all.yaml
+```
+
+**Stage 2 — Fine-tuning (LR = 4e-5):** Lower the learning rate to **4e-5** (edit `lr` in the config file) and train for another **3–4 epochs**.
+
+> **Important:** For this stage, do **not** use `--resume`. `--resume` restores the optimizer and lr scheduler saved in the checkpoint and would continue the old 2e-4 schedule. Instead, use `--init_from` to load only the model weights from the Stage-1 checkpoint, so the optimizer and scheduler start fresh with the new learning rate:
+
+```bash
+python train.py --config ./configs/robotwin_all.yaml \
+    --init_from ./checkpoints_vla/<stage1_checkpoint>.pt
+```
+
+- `--resume`: for recovering from an interruption — restores model + optimizer + scheduler + epoch, continuing the original lr schedule.
+- `--init_from`: for stage switching — loads **model weights only**; optimizer and lr scheduler are rebuilt from `--config`. The two options are mutually exclusive.
+
+
 ## Evaluation on RoboTwin 2.0
 
 **Please refer to [README_EVAL.md](README_EVAL.md) for detailed evaluation instructions**.
