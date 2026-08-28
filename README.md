@@ -12,38 +12,36 @@ retained. LAVA is used only during training and adds no inference-time branch.
 
 ## Method
 
-For a sampled interval of length \(L\), LAVA extracts frozen DINOv3 patch
+For a sampled interval of length $L$, LAVA extracts frozen DINOv3 patch
 features from the same episode and constructs visual changes
 
-\[
+$$
 \Delta Z_i = Z_{i+1} - Z_i.
-\]
+$$
 
 A learnable-query World Residual encoder compresses every patch-level change to
 a 32-dimensional residual. On the action side, LAVA uses the final-normalized
 action hidden state immediately before the action output head and a shared MLP
 projector. The alignment is offset by one step:
 
-\[
+$$
 \Delta Z_i \longleftrightarrow h_{i+1},
-\]
+$$
 
-so \(h_0\) is never used by LAVA.
+so $h_0$ is never used by LAVA.
 
 Both residual paths receive a normalized time channel and are pooled with a
 differentiable depth-2 log-signature. A one-way Action-to-World InfoNCE loss
-uses other world paths in the batch as negatives. For \(L\ge2\), an adjacent
+uses other world paths in the batch as negatives. For $L \ge 2$, an adjacent
 swap of two visual residuals is also added as an order-aware hard negative.
 
 The training objective is
 
-\[
-\mathcal L = \mathcal L_{\mathrm{flow}}
-+ 0.5\,\mathcal L_{\mathrm{future}}
-+ \lambda_{\mathrm{LAVA}}(s)\,\mathcal L_{\mathrm{LAVA}},
-\]
+$$
+\mathcal L = \mathcal L_{\mathrm{flow}} + 0.5\,\mathcal L_{\mathrm{future}} + \lambda_{\mathrm{LAVA}}(s)\,\mathcal L_{\mathrm{LAVA}}.
+$$
 
-where \(\lambda_{\mathrm{LAVA}}\) linearly warms from 0 to 0.1 over the first
+where $\lambda_{\mathrm{LAVA}}$ linearly warms from 0 to 0.1 over the first
 5% of optimizer steps.
 
 ## Default LAVA configuration
