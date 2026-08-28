@@ -1,126 +1,192 @@
-# LiLa-WAM: Lightweight Latent Reasoning World-Action Model for Robot Manipulation
+# LAVA: Learning Action Semantics from Multi-Scale World Evolution
 
-Official implementation of **LiLa-WAM**, a lightweight world-action model that is trainable on a **single consumer-grade GPU (24 GB)**.
+LAVA is a research implementation that extends
+[LiLa-WAM](https://github.com/teee000/LiLa-WAM) with an auxiliary training
+objective for aligning action representations with multi-scale visual world
+evolution. The flow-matching and future-feature objectives from LiLa-WAM are
+retained. LAVA is used only during training and adds no inference-time branch.
 
-&gt; 📄 Paper: [arXiv](https://arxiv.org/pdf/2608.03701). | 🌐 Project Page: [teee000.github.io/LiLa-WAM-page](https://teee000.github.io/LiLa-WAM-page/)
+> This repository is an experimental research fork, not the official
+> LiLa-WAM repository. Results are still being validated; no benchmark claim is
+> made here yet.
 
-## Overview
+## Method
 
-LiLa-WAM achieves an average success rate of **90.48%** on the 50 RoboTwin 2.0 tasks under the clean setting, while remaining trainable on a **single RTX 5090** (~110 GPU hours for joint training on all 50 tasks). The full model contains **0.5B parameters**, of which only 0.2B are trainable.
+For a sampled interval of length \(L\), LAVA extracts frozen DINOv3 patch
+features from the same episode and constructs visual changes
 
-Key features:
+\[
+\Delta Z_i = Z_{i+1} - Z_i.
+\]
 
-- 🪶 **Lightweight**: 0.5B parameters (0.2B trainable), trainable on a single 24 GB GPU
-- 🔮 **World-action modeling**: latent future-state prediction coupled with action generation
-- 🎯 **Visual Transition Tokens (VTT)**
-- 🤖 **Evaluated on**: RoboTwin 2.0 (50 tasks), LIBERO, and real-robot experiments
+A learnable-query World Residual encoder compresses every patch-level change to
+a 32-dimensional residual. On the action side, LAVA uses the final-normalized
+action hidden state immediately before the action output head and a shared MLP
+projector. The alignment is offset by one step:
 
-<p align="center">
-  <img src="assets/compare_robotwin.png" width="48%"/>
-  <img src="assets/compare_libero.png" width="48%"/>
-</p>
-<p align="center">
-  <em>Success rate vs. model parameters on RoboTwin 2.0 (left) and LIBERO (right).
-  Bubble size denotes the number of parameters.</em>
-</p>
+\[
+\Delta Z_i \longleftrightarrow h_{i+1},
+\]
 
+so \(h_0\) is never used by LAVA.
 
-<p align="center">
-  <img src="assets/FrameWork.png" width="95%"/>
-</p>
-<p align="center">
-  <em>LiLa-WAM Framework.</em>
-</p>
+Both residual paths receive a normalized time channel and are pooled with a
+differentiable depth-2 log-signature. A one-way Action-to-World InfoNCE loss
+uses other world paths in the batch as negatives. For \(L\ge2\), an adjacent
+swap of two visual residuals is also added as an order-aware hard negative.
+
+The training objective is
+
+\[
+\mathcal L = \mathcal L_{\mathrm{flow}}
++ 0.5\,\mathcal L_{\mathrm{future}}
++ \lambda_{\mathrm{LAVA}}(s)\,\mathcal L_{\mathrm{LAVA}},
+\]
+
+where \(\lambda_{\mathrm{LAVA}}\) linearly warms from 0 to 0.1 over the first
+5% of optimizer steps.
+
+## Default LAVA configuration
+
+The defaults live in [`configs/robotwin_all.yaml`](configs/robotwin_all.yaml):
+
+```yaml
+model:
+  lava:
+    enabled: true
+    dino_target_layer: -4
+    residual_dim: 32
+    qformer:
+      hidden_dim: 256
+      num_queries: 1
+      num_layers: 2
+      num_heads: 4
+    logsig_depth: 2
+
+training:
+  lambda_lava: 0.1
+  lava_temperature: 0.07
+  lava_scales: [1, 2, 4, 8, 16]
+  lava_sample_ratio: 0.25
+  lava_scale_sampling: uniform
+  lava_warmup_ratio: 0.05
+  lava_order_negative: true
+```
+
+The fixed method choices are:
+
+- frozen DINOv3 targets from layer `-4`;
+- final-norm, pre-head action hidden states;
+- visual differences `Z[t+1] - Z[t]`;
+- normalized time augmentation;
+- one-way Action-to-World InfoNCE;
+- a shared action projector across positions and scales;
+- no LAVA execution during policy inference.
 
 ## Installation
 
-
-### Setup
-
-1. Create and activate the conda environment:
+Python 3.10 is recommended.
 
 ```bash
-conda create -n LiLaWAM python=3.10 -y
-conda activate LiLaWAM
+conda create -n lava python=3.10 -y
+conda activate lava
+
+pip install torch==2.7.1 torchvision==0.22.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+pip install transformers==5.0.0rc0 omegaconf accelerate h5py pytest
 ```
 
-2. Install PyTorch (CUDA 12.8):
-
-```bash
-pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-```
-
-3. Install other dependencies:
-
-```bash
-pip install transformers==5.0.0rc0 omegaconf accelerate h5py
-```
-
-## Preparation
-
-Our processed RoboTwin 2.0 dataset is available on ModelScope. Search for **`LiLa-WAM_RoboTwin2.0_50_task`** on [ModelScope](https://www.modelscope.cn) to download.
-
-LiLa-WAM uses the frozen **DINOv3 ViT-L/16** encoder:
-
-- Model: `dinov3-vitl16-pretrain-lvd1689m`
-
-- **`utils/clean_dataset_stationary.py`**
-  Removes stationary segments (steps where the robot barely moves) from raw demonstrations.
-
-### Normalization Statistics
-
-- **`utils/calc_stat_remove_outlier.py`**
-  Computes normalization statistics over the training dataset with outlier removal.
-- **`utils/stat-500-all.json`**
-  Pre-computed normalization statistics covering all 50 tasks, so you can start training directly without re-computing them.
-
-## Configuration
-
-Before training or evaluation, update the following paths in the configuration files under `configs/`:
+LAVA uses the frozen `dinov3-vitl16-pretrain-lvd1689m` encoder. Update these
+configuration fields before training:
 
 | Field | Description |
 |---|---|
-| `dataset_dir` | Path to the training dataset |
-| `task_cond_dir` | Path to the VTT embedding files |
-| `model.vision_encoder.checkpoint_path` | Path to the pretrained DINOv3 checkpoint |
+| `dataset.dataset_dir` | Processed RoboTwin dataset root |
+| `dataset.task_cond_dir` | Precomputed VTT/task-condition directory |
+| `model.vision_encoder.checkpoint_path` | Local DINOv3 checkpoint directory |
 
+The processed 50-task RoboTwin dataset and LiLa-WAM checkpoints are described
+in the [upstream repository](https://github.com/teee000/LiLa-WAM). This
+repository does not include raw datasets, DINO weights, training runs, or model
+checkpoints.
 
-## Training Details (Two-Stage Learning Rate Schedule)
+## RoboTwin task sets
 
-The default config (`configs/robotwin_all.yaml`) sets a total of **40 epochs** with a learning rate of **2e-4**. In practice, however, you do **not** need to train for all 40 epochs. We recommend a two-stage schedule:
+`dataset.task_set` accepts:
 
-**Stage 1 — Base training (LR = 2e-4):** Train for about **11–12 epochs**, then stop early. There is no need to complete the full 40 epochs.
+- `"50"`: all RoboTwin tasks;
+- `"10"`: the 10-task development subset, capped at 50 clean and 200
+  randomized demonstrations per task.
+
+The subset utility is available at
+[`utils/build_robotwin_10_subset.py`](utils/build_robotwin_10_subset.py).
+
+## Training
+
+Stage 1 uses 12 epochs with a peak learning rate of `2e-4`:
 
 ```bash
-python train.py --config ./configs/robotwin_all.yaml
+python train.py --config configs/robotwin_all.yaml --set \
+  training.epochs=12 \
+  training.learning_rate=2e-4
 ```
 
-**Stage 2 — Fine-tuning (LR = 4e-5):** Lower the learning rate to **4e-5** (edit `lr` in the config file) and train for another **3–4 epochs**.
-
-> **Important:** For this stage, do **not** use `--resume`. `--resume` restores the optimizer and lr scheduler saved in the checkpoint and would continue the old 2e-4 schedule. Instead, use `--init_from` to load only the model weights from the Stage-1 checkpoint, so the optimizer and scheduler start fresh with the new learning rate:
+Stage 2 initializes model weights from the final Stage-1 checkpoint but creates
+a fresh optimizer and scheduler. Do not use `--resume` for the stage switch:
 
 ```bash
-python train.py --config ./configs/robotwin_all.yaml \
-    --init_from ./checkpoints_vla/<stage1_checkpoint>.pt
+python train.py --config configs/robotwin_all.yaml \
+  --init_from /path/to/stage1_epoch_12.pt \
+  --set training.epochs=4 training.learning_rate=4e-5 \
+        training.lava_warmup_ratio=0.0
 ```
 
-- `--resume`: for recovering from an interruption — restores model + optimizer + scheduler + epoch, continuing the original lr schedule.
-- `--init_from`: for stage switching — loads **model weights only**; optimizer and lr scheduler are rebuilt from `--config`. The two options are mutually exclusive.
+Use `--resume` only to recover an interruption within the same stage; it
+restores model, optimizer, scheduler, epoch, and LAVA warmup progress.
 
+CML-specific single-H100-NVL Slurm templates and an `afterok` two-stage
+launcher are under [`scripts/slurm`](scripts/slurm).
 
-## Evaluation on RoboTwin 2.0
+## Monitoring
 
-**Please refer to [README_EVAL.md](README_EVAL.md) for detailed evaluation instructions**.
+The optimizer-step CSV records base losses, LAVA behavior, representation
+health, per-scale metrics, flow-timestep bins, gradients, throughput, and GPU
+memory. The most important diagnostics are:
 
-## Checkpoints
+```text
+Loss_Flow, Loss_Future, Loss_LAVA, Lambda_LAVA
+Pos_Sim, Negative_Sim, Shuffle_Sim, Order_Margin, Retrieval_Acc
+Loss_S1/S2/S4/S8/S16
+Pos_Sim_S1/S2/S4/S8/S16
+Order_Margin_S1/S2/S4/S8/S16
+Grad_Norm, Grad_Norm_LAVA_Branch
+```
 
-Pre-trained weights on RoboTwin 2.0 (50 tasks) are available on ModelScope:
-[ModelScope](https://www.modelscope.cn/models/yangfan97/LiLa-WAM_RoboTwin2_0)
-[Google Drive](https://drive.google.com/drive/folders/15usxTjIyOTC4Fu2VNVoZ03efptM1mNFa?usp=drive_link)
+`Order_Margin` is the paired cosine difference between the correctly ordered
+world path and its adjacent-swap negative. Scale 1 has no order negative.
 
-## Citation
+## Tests
 
-If you find this work useful, please consider citing:
+Run the focused LAVA tests with:
+
+```bash
+pytest -q tests/test_lava.py
+```
+
+They cover interval bounds, the one-frame action/world offset, depth-2
+log-signature dimensionality and order sensitivity, mixed-precision InfoNCE
+backpropagation, frozen-DINO behavior, and the inference fast path.
+
+## Evaluation
+
+The inherited RoboTwin evaluation entry point is documented in
+[`README_EVAL.md`](README_EVAL.md). LAVA modules are present in LAVA
+checkpoints but are not called during policy inference.
+
+## Acknowledgements
+
+LAVA is built directly on LiLa-WAM. Please cite the original work when using
+this repository:
 
 ```bibtex
 @article{yang2026lila,
@@ -130,3 +196,6 @@ If you find this work useful, please consider citing:
   year={2026}
 }
 ```
+
+The upstream paper and project page are available from the
+[official LiLa-WAM repository](https://github.com/teee000/LiLa-WAM).

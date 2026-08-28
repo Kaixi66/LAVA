@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local secrets
+.conda/
+.venv/
+venv/
+.env
+.env.*
+
+# Training/evaluation artifacts
+log/
+logs/
+runs/
+wandb/
+checkpoints*/
+*.pt
+*.pth
+*.ckpt
+*.csv
+
+# Local datasets and pretrained models
+data/
+datasets/
+pretrained/
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store

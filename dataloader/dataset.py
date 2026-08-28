@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 NUM_THREADS = os.cpu_count() or 4
 
+# Task subset used for the RoboTwin ablations in LiLa-WAM, Section 4.2.
+ROBOTWIN_TASK_SETS = {
+    "10": (
+        "adjust_bottle",
+        "grab_roller",
+        "hanging_mug",
+        "move_stapler_pad",
+        "open_microwave",
+        "press_stapler",
+        "scan_object",
+        "stack_blocks_two",
+        "stamp_seal",
+        "turn_switch",
+    ),
+}
+
 # ImageNet normalization (DINOv3 uses ImageNet stats)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -49,7 +65,10 @@ class RobotWinTaskDataset(data.Dataset):
                  indices_config=None, camera_names=None, image_size=(320, 240),
                  val=False, image_aug=False,
                  task_cond_dir=None,
-                 use_future_feat=False, future_frame_offset=None):
+                 use_future_feat=False, future_frame_offset=None,
+                 task_set="50",
+                 use_lava=False, lava_scales=None, lava_sample_ratio=0.25,
+                 lava_scale_sampling="uniform", lava_scale_probs=None):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -67,6 +86,13 @@ class RobotWinTaskDataset(data.Dataset):
                              prediction training)
             future_frame_offset: offset of the future frame relative to the current
                                  anchor; None -> = chunk_size
+            task_set: "50" / "all" for all tasks, or "10" for the paper's
+                      fixed 10-task list (the dataset root controls episodes)
+            use_lava: return a sampled multi-scale frame evolution path
+            lava_scales: candidate temporal intervals in action-token steps
+            lava_sample_ratio: probability that a dataset sample receives LAVA supervision
+            lava_scale_sampling: "uniform" or "weighted"
+            lava_scale_probs: probabilities corresponding to lava_scales in weighted mode
         """
         if indices_config is None:
             raise ValueError("indices_config is required")
@@ -76,6 +102,15 @@ class RobotWinTaskDataset(data.Dataset):
         self.dataset_dirs = [Path(dataset_dir)] if isinstance(dataset_dir, str) else [Path(p) for p in dataset_dir]
         self.data_mode = data_mode
         self.all_episodes = []
+
+        self.task_set = str(task_set).lower()
+        if self.task_set in {"50", "all"}:
+            self.selected_tasks = None
+        elif self.task_set in ROBOTWIN_TASK_SETS:
+            self.selected_tasks = frozenset(ROBOTWIN_TASK_SETS[self.task_set])
+        else:
+            choices = ", ".join(["50", "all", *sorted(ROBOTWIN_TASK_SETS)])
+            raise ValueError(f"Unknown RoboTwin task_set '{task_set}'. Choose one of: {choices}")
 
         # Future frame (future-feature prediction): offset defaults to chunk_size
         self.use_future_feat = use_future_feat
@@ -92,6 +127,32 @@ class RobotWinTaskDataset(data.Dataset):
             f"DINOv3 requires H/W to be multiples of 16, got {self.image_size}"
         self.val = val
         self.image_aug = image_aug
+
+        # LAVA supervision is training-only. Its temporal convention assumes
+        # action token k corresponds to the frame at anchor+k.
+        self.use_lava = bool(use_lava) and not val
+        self.lava_scales = tuple(int(scale) for scale in (lava_scales or [1, 2, 4, 8, 16]))
+        self.lava_sample_ratio = float(lava_sample_ratio)
+        self.lava_scale_sampling = str(lava_scale_sampling)
+        self.lava_scale_probs = None if lava_scale_probs is None else tuple(float(p) for p in lava_scale_probs)
+        if self.use_lava:
+            if not 0.0 <= self.lava_sample_ratio <= 1.0:
+                raise ValueError(f"lava_sample_ratio must be in [0,1], got {self.lava_sample_ratio}")
+            if not self.lava_scales or any(scale < 1 or scale >= self.chunk_size for scale in self.lava_scales):
+                raise ValueError(
+                    f"Every LAVA scale must satisfy 1 <= scale < action chunk size {self.chunk_size}; "
+                    f"got {self.lava_scales}")
+            if not torch.equal(self.action_offsets, torch.arange(self.chunk_size)):
+                raise ValueError(
+                    "LAVA requires contiguous action_indices [0, ..., chunk_size-1] for temporal alignment")
+            if self.lava_scale_sampling not in {"uniform", "weighted"}:
+                raise ValueError(
+                    f"lava_scale_sampling must be 'uniform' or 'weighted', got {self.lava_scale_sampling}")
+            if self.lava_scale_sampling == "weighted":
+                if self.lava_scale_probs is None or len(self.lava_scale_probs) != len(self.lava_scales):
+                    raise ValueError("weighted LAVA scale sampling requires one probability per scale")
+                if any(p < 0 for p in self.lava_scale_probs) or sum(self.lava_scale_probs) <= 0:
+                    raise ValueError("lava_scale_probs must be non-negative with a positive sum")
 
         # Task condition vector directory
         self.task_cond_dir = task_cond_dir
@@ -121,6 +182,28 @@ class RobotWinTaskDataset(data.Dataset):
 
         if self.use_future_feat:
             logger.info(f"Future-Feat mode ENABLED: will return future frame at offset={self.future_frame_offset}.")
+        if self.use_lava:
+            logger.info(
+                f"LAVA sampling ENABLED: scales={list(self.lava_scales)}, "
+                f"sample_ratio={self.lava_sample_ratio}, scale_sampling={self.lava_scale_sampling}.")
+
+    def _sample_lava_interval(self, local_anchor_idx, total_frames):
+        """Return (start, scale) fully contained in both episode and action chunk."""
+        if not self.use_lava or random.random() >= self.lava_sample_ratio:
+            return None
+        max_transition = min(self.chunk_size - 1, total_frames - 1 - local_anchor_idx)
+        available = [scale for scale in self.lava_scales if scale <= max_transition]
+        if not available:
+            return None
+
+        if self.lava_scale_sampling == "uniform":
+            scale = random.choice(available)
+        else:
+            probability_by_scale = dict(zip(self.lava_scales, self.lava_scale_probs))
+            weights = [probability_by_scale[scale] for scale in available]
+            scale = random.choices(available, weights=weights, k=1)[0]
+        start = random.randint(0, max_transition - scale)
+        return start, scale
 
     def _build_index_map(self):
         """Iterate over all episodes, collect metadata and build the flat index"""
@@ -185,7 +268,11 @@ class RobotWinTaskDataset(data.Dataset):
         if not data_dir.exists():
             return []
         valid_episodes = []
-        for hdf5_path in data_dir.glob("*.hdf5"):
+        hdf5_paths = sorted(
+            data_dir.glob("*.hdf5"),
+            key=lambda p: int(p.stem.removeprefix("episode")),
+        )
+        for hdf5_path in hdf5_paths:
             valid_episodes.append({
                 'episode_name': hdf5_path.stem,
                 'task_name': task_path.parent.name if task_path.name in ['demo_clean', 'demo_randomized'] else task_path.name,
@@ -196,23 +283,39 @@ class RobotWinTaskDataset(data.Dataset):
 
     def _load_episodes(self):
         """Walk the given root directories and find all task folders"""
-        logger.info("Scanning dataset folders for all tasks...")
+        scope = "all 50 tasks" if self.selected_tasks is None else f"{self.task_set} ({len(self.selected_tasks)} tasks)"
+        logger.info(f"Scanning dataset folders for task set: {scope}")
         data_splits = ["demo_clean", "demo_randomized"] if self.data_mode == "both" else [f"demo_{self.data_mode}"]
+        found_tasks = set()
 
         for root_dir in self.dataset_dirs:
             if not root_dir.exists():
                 continue
-            for task_dir in [d for d in root_dir.iterdir() if d.is_dir()]:
+            for task_dir in sorted(d for d in root_dir.iterdir() if d.is_dir()):
+                if self.selected_tasks is not None and task_dir.name not in self.selected_tasks:
+                    continue
+                found_tasks.add(task_dir.name)
+                task_episodes = []
                 for split in data_splits:
                     split_path = task_dir / split
                     if split_path.exists():
                         episodes = self._scan_task_folder(split_path, split)
-                        self.all_episodes.extend(episodes)
+                        task_episodes.extend(episodes)
+
+                self.all_episodes.extend(task_episodes)
+
+        if self.selected_tasks is not None:
+            missing_tasks = sorted(self.selected_tasks - found_tasks)
+            if missing_tasks:
+                raise FileNotFoundError(
+                    f"RoboTwin task_set '{self.task_set}' is missing task directories: {missing_tasks}")
 
         if not self.all_episodes:
             raise ValueError(f"No valid episodes found in: {self.dataset_dirs}")
 
-        logger.info(f"Successfully scanned {len(self.all_episodes)} total episode files.")
+        logger.info(
+            f"Successfully scanned {len(self.all_episodes)} episode files "
+            f"from {len(found_tasks)} tasks.")
 
     def _get_query_indices(self, query_idx: int, episode_len: int) -> Tuple[Dict[str, List[int]], Dict[str, torch.Tensor]]:
         ep_start, ep_end = 0, episode_len
@@ -291,6 +394,23 @@ class RobotWinTaskDataset(data.Dataset):
                             cv2.resize(i, self.image_size, interpolation=cv2.INTER_LINEAR) for i in fut_img
                         ])
                     data_batch['future_frame'] = fut_img   # (1, H, W, 3) uint8 RGB
+
+            # LAVA evolution frames: primary camera, no color augmentation.
+            if self.use_lava and 'evolution_frames' in query_indices:
+                cam0 = self.camera_names[0]
+                if cam0 in root['observation']:
+                    t_idx_e = np.array(query_indices['evolution_frames'])
+                    h5_idx_e = np.unique(t_idx_e)
+                    comp_e = root['observation'][cam0]['rgb'][h5_idx_e]
+                    decoded_e = np.stack([_decode(img) for img in comp_e])
+                    evolution_img = np.ascontiguousarray(
+                        decoded_e[np.searchsorted(h5_idx_e, t_idx_e)])
+                    if (evolution_img.shape[2], evolution_img.shape[1]) != self.image_size:
+                        evolution_img = np.stack([
+                            cv2.resize(i, self.image_size, interpolation=cv2.INTER_LINEAR)
+                            for i in evolution_img
+                        ])
+                    data_batch['evolution_frames'] = evolution_img
         return data_batch
 
     def __len__(self) -> int:
@@ -309,6 +429,14 @@ class RobotWinTaskDataset(data.Dataset):
             total_frames = ep_meta['length']
 
             query_indices, padding_mask = self._get_query_indices(local_anchor_idx, total_frames)
+
+            lava_interval = self._sample_lava_interval(local_anchor_idx, total_frames)
+            if lava_interval is not None:
+                lava_start, lava_scale = lava_interval
+                query_indices['evolution_frames'] = list(range(
+                    local_anchor_idx + lava_start,
+                    local_anchor_idx + lava_start + lava_scale + 1,
+                ))
 
             # Future frame query index (single frame, anchor + offset)
             if self.use_future_feat:
@@ -362,6 +490,14 @@ class RobotWinTaskDataset(data.Dataset):
                     future_pixel_values = future_pixel_values.squeeze(0)   # (3, H, W)
                 result['future_pixel_values'] = future_pixel_values
 
+            if lava_interval is not None and 'evolution_frames' in data_batch:
+                evolution_np = data_batch['evolution_frames']
+                evolution_normed = np.stack(
+                    [_normalize_image(img) for img in evolution_np], axis=0)
+                result['evolution_pixel_values'] = torch.from_numpy(evolution_normed).float()
+                result['evolution_start'] = lava_start
+                result['evolution_scale'] = lava_scale
+
             # Task condition vector (looked up by the episode's task_name)
             if self.use_task_cond:
                 task_name = ep_meta['task_name']
@@ -378,6 +514,10 @@ def create_dataset(config: Any, val: bool = False):
     """
     Factory function: create a RobotWinTaskDataset instance (DINOv3 version)
     """
+    if config.dataset.get('type', 'robotwin').lower() == 'libero':
+        from .libero_dataset import create_libero_dataset
+        return create_libero_dataset(config, val=val)
+
     from omegaconf import OmegaConf
     indices_config = OmegaConf.to_container(config.dataset.indices_config, resolve=True)
 
@@ -395,6 +535,15 @@ def create_dataset(config: Any, val: bool = False):
     use_future_feat = ff_cfg.get('enabled', False) if ff_cfg else False
     future_frame_offset = config.dataset.get('future_frame_offset', None)
 
+    lava_cfg = config.model.get('lava', {})
+    use_lava = bool(lava_cfg.get('enabled', False)) if lava_cfg else False
+    lava_scales = list(config.training.get('lava_scales', [1, 2, 4, 8, 16]))
+    lava_sample_ratio = float(config.training.get('lava_sample_ratio', 0.25))
+    lava_scale_sampling = str(config.training.get('lava_scale_sampling', 'uniform'))
+    lava_scale_probs = config.training.get('lava_scale_probs', None)
+    if lava_scale_probs is not None:
+        lava_scale_probs = list(lava_scale_probs)
+
     params = {
         'dataset_dir': config.dataset.dataset_dir,
         'indices_config': indices_config,
@@ -406,6 +555,12 @@ def create_dataset(config: Any, val: bool = False):
         'task_cond_dir': task_cond_dir,
         'use_future_feat': use_future_feat,
         'future_frame_offset': future_frame_offset,
+        'task_set': config.dataset.get('task_set', '50'),
+        'use_lava': use_lava,
+        'lava_scales': lava_scales,
+        'lava_sample_ratio': lava_sample_ratio,
+        'lava_scale_sampling': lava_scale_sampling,
+        'lava_scale_probs': lava_scale_probs,
     }
 
     return RobotWinTaskDataset(**params)
@@ -417,7 +572,8 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         return None
 
     result = {}
-    keys = batch[0].keys()
+    lava_keys = {'evolution_pixel_values', 'evolution_start', 'evolution_scale'}
+    keys = [key for key in batch[0].keys() if key not in lava_keys]
 
     for key in keys:
         val = batch[0][key]
@@ -428,5 +584,24 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         else:
             # Skip unknown types
             result[key] = [sample[key] for sample in batch]
+
+    lava_samples = [
+        (batch_idx, sample) for batch_idx, sample in enumerate(batch)
+        if sample.get('evolution_pixel_values') is not None
+    ]
+    if lava_samples:
+        result['evolution_pixel_values'] = [
+            sample['evolution_pixel_values'] for _, sample in lava_samples]
+        result['evolution_batch_indices'] = torch.tensor(
+            [batch_idx for batch_idx, _ in lava_samples], dtype=torch.long)
+        result['evolution_starts'] = torch.tensor(
+            [sample['evolution_start'] for _, sample in lava_samples], dtype=torch.long)
+        result['evolution_scales'] = torch.tensor(
+            [sample['evolution_scale'] for _, sample in lava_samples], dtype=torch.long)
+    else:
+        result['evolution_pixel_values'] = None
+        result['evolution_batch_indices'] = None
+        result['evolution_starts'] = None
+        result['evolution_scales'] = None
 
     return result

@@ -7,13 +7,18 @@
 import sys
 import os
 import subprocess
+import time
 import matplotlib.pyplot as plt
 
 # RoboTwin internally uses many paths relative to its root directory
-# (./assets/..., ./task_config/...), so make sure the cwd is always the
-# directory containing this script (the RoboTwin root), no matter where
-# the process is launched from.
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# (./assets/..., ./task_config/...).  The upstream script assumes this file is
+# copied into RoboTwin.  On the cluster we keep it in LiLa-WAM and pass the
+# simulator checkout through ROBOTWIN_ROOT instead.
+_bridge_directory = os.path.dirname(os.path.abspath(__file__))
+ROBOTWIN_ROOT = os.path.abspath(os.environ.get("ROBOTWIN_ROOT", _bridge_directory))
+os.chdir(ROBOTWIN_ROOT)
+if ROBOTWIN_ROOT not in sys.path:
+    sys.path.insert(0, ROBOTWIN_ROOT)
 
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
@@ -34,7 +39,51 @@ logging.getLogger("curobo").setLevel(logging.WARNING)
 
 
 current_file_path = os.path.abspath(__file__)
-parent_directory = os.path.dirname(current_file_path)
+parent_directory = ROBOTWIN_ROOT
+
+
+def write_progress(progress, task_done, task_success, state="running"):
+    """Atomically persist worker progress so ETA can be inspected externally."""
+    if not progress or not progress.get("status_path"):
+        return
+
+    elapsed = max(time.time() - progress["started_at"], 0.0)
+    completed = progress["task_index"] * progress["test_num"] + task_done
+    total = progress["total_tasks"] * progress["test_num"]
+    seconds_per_rollout = elapsed / completed if completed else None
+    eta_seconds = seconds_per_rollout * (total - completed) if completed else None
+    payload = {
+        "state": state,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "pid": os.getpid(),
+        "hostname": os.uname().nodename,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "current_task": progress["task_name"],
+        "task_index": progress["task_index"],
+        "total_tasks": progress["total_tasks"],
+        "task_rollouts_done": task_done,
+        "task_rollouts_total": progress["test_num"],
+        "task_success": task_success,
+        "total_rollouts_done": completed,
+        "total_rollouts": total,
+        "elapsed_seconds": elapsed,
+        "seconds_per_rollout": seconds_per_rollout,
+        "eta_seconds": eta_seconds,
+    }
+    status_path = progress["status_path"]
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    temporary_path = f"{status_path}.tmp.{os.getpid()}"
+    with open(temporary_path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+    os.replace(temporary_path, status_path)
+
+    eta_text = "unknown" if eta_seconds is None else f"{eta_seconds / 3600:.2f}h"
+    print(
+        f"EVAL_PROGRESS {completed}/{total} | task={progress['task_name']} "
+        f"{task_done}/{progress['test_num']} | elapsed={elapsed / 3600:.2f}h | "
+        f"eta={eta_text}",
+        flush=True,
+    )
 
 
 def class_decorator(task_name):
@@ -87,6 +136,11 @@ def main(usr_args):
 
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+    save_videos = os.environ.get("EVAL_SAVE_VIDEOS")
+    if save_videos is not None:
+        if save_videos not in {"0", "1"}:
+            raise ValueError("EVAL_SAVE_VIDEOS must be 0 or 1")
+        args["eval_video_log"] = save_videos == "1"
     print('args:', args)
     args['task_name'] = task_name
     args["task_config"] = task_config
@@ -168,10 +222,14 @@ def main(usr_args):
     seed = usr_args["seed"]
     st_seed = 100000 * (1 + seed)
 
-    checkpoint_path = os.path.join(
-        model_base_path,
-        f"checkpoints_vla/{ckpt_setting}/checkpoint_epoch_{checkpoint_ep}.pt",
-    )
+    checkpoint_path = usr_args.get("checkpoint_path")
+    if checkpoint_path:
+        checkpoint_path = os.path.abspath(checkpoint_path)
+    else:
+        checkpoint_path = os.path.join(
+            model_base_path,
+            f"checkpoints_vla/{ckpt_setting}/checkpoint_epoch_{checkpoint_ep}.pt",
+        )
 
     auto_config_path = os.path.join(os.path.dirname(checkpoint_path), "config.yaml")
     if os.path.exists(auto_config_path):
@@ -206,7 +264,8 @@ def main(usr_args):
                                    st_seed,
                                    test_num=usr_args["test_num"],
                                    video_size=video_size,
-                                   instruction_type=instruction_type)
+                                   instruction_type=instruction_type,
+                                   progress=usr_args.get("_progress"))
 
     file_path = save_dir / "result.txt"
     with open(file_path, "w") as f:
@@ -294,7 +353,8 @@ def eval_policy(task_name,
                 st_seed,
                 test_num=100,
                 video_size=None,
-                instruction_type=None):
+                instruction_type=None,
+                progress=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
 
     expert_check = True
@@ -411,6 +471,7 @@ def eval_policy(task_name,
             f"\033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, "
             f"current seed: \033[90m{now_seed}\033[0m\n"
         )
+        write_progress(progress, TASK_ENV.test_num, TASK_ENV.suc)
         now_seed += 1
 
     return now_seed, TASK_ENV.suc
@@ -425,6 +486,8 @@ def parse_args_and_config():
 
     parser.add_argument("--ckpt_setting", type=str, required=True)
     parser.add_argument("--checkpoint_ep", type=str, required=True)
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="absolute checkpoint path; overrides the legacy checkpoints_vla layout")
     parser.add_argument("--model_base_path", type=str, required=True)
     parser.add_argument("--norm_stats_path", type=str, default='utils/stat-500-all.json')
     parser.add_argument("--config_path", type=str, default='configs/robotwin_all.yaml')
@@ -450,10 +513,26 @@ if __name__ == "__main__":
 
     usr_args = parse_args_and_config()
 
+    worker_started_at = time.time()
+    status_path = None
+    if usr_args.get("result_json"):
+        result_base, _ = os.path.splitext(usr_args["result_json"])
+        status_path = f"{result_base}_status.json"
+
     results = []
-    for t_name in usr_args["task_names"]:
+    total_tasks = len(usr_args["task_names"])
+    for task_index, t_name in enumerate(usr_args["task_names"]):
         print(f"\n{'='*20} Start: {t_name} {'='*20}")
         usr_args["task_name"] = t_name
+        usr_args["_progress"] = {
+            "status_path": status_path,
+            "started_at": worker_started_at,
+            "task_name": t_name,
+            "task_index": task_index,
+            "total_tasks": total_tasks,
+            "test_num": usr_args["test_num"],
+        }
+        write_progress(usr_args["_progress"], 0, 0)
         suc_num = main(usr_args)
         results.append({
             "task_name": t_name,
@@ -481,3 +560,9 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(usr_args["result_json"]), exist_ok=True)
         with open(usr_args["result_json"], "w") as f:
             json.dump({"results": results}, f, indent=2)
+        write_progress(
+            usr_args.get("_progress"),
+            usr_args["test_num"],
+            results[-1]["success"] if results else 0,
+            state="completed",
+        )

@@ -115,15 +115,19 @@ def main():
                         default='/home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10-taskcond-clean',
                         help="new directory that mirrors the dataset task structure for saving task condition vectors")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dataset_dir", type=str, default=None,
+                        help="optional dataset_dir override from the YAML config")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="optional DINO checkpoint override from the YAML config")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
 
-    dataset_dir = cfg.dataset.dataset_dir
+    dataset_dir = args.dataset_dir or cfg.dataset.dataset_dir
     data_mode = cfg.dataset.data_mode
     camera_name = list(cfg.dataset.camera_names)[0]
     image_size = tuple(OmegaConf.to_container(cfg.dataset.image_size, resolve=True))   # (W,H)
-    ckpt_path = cfg.model.vision_encoder.checkpoint_path
+    ckpt_path = args.checkpoint_path or cfg.model.vision_encoder.checkpoint_path
 
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if (device != "cpu" and torch.cuda.is_bf16_supported()) else torch.float32

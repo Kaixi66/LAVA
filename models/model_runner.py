@@ -31,7 +31,7 @@ class ModelFactory:
 
         model = AutoModel.from_pretrained(
             checkpoint_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             local_files_only=True,
         ).to(device)
 
@@ -85,6 +85,16 @@ class ModelFactory:
         future_feat_depth = ff_cfg['num_decoder_layers']
         future_feat_heads = ff_cfg['num_heads']
 
+        # ---- LAVA training branch ----
+        lava_cfg = model_cfg.get('lava', {})
+        use_lava = bool(lava_cfg.get('enabled', False)) if lava_cfg else False
+        qformer_cfg = lava_cfg.get('qformer', {}) if lava_cfg else {}
+        if use_lava:
+            logger.info(
+                f"LAVA ENABLED: target_layer={lava_cfg.get('dino_target_layer', -4)}, "
+                f"residual_dim={lava_cfg.get('residual_dim', 32)}, "
+                f"logsig_depth={lava_cfg.get('logsig_depth', 2)}")
+
         # Future-frame patch token count (number of queries for dense prediction); image_size=(W,H)
         img_w, img_h = tuple(config.dataset.image_size)
         num_patches = (img_h // patch_size) * (img_w // patch_size)
@@ -117,6 +127,14 @@ class ModelFactory:
             future_feat_out_dim=dino_hidden_size,
             future_feat_depth=future_feat_depth,
             future_feat_heads=future_feat_heads,
+            use_lava=use_lava,
+            lava_dino_feat_dim=dino_hidden_size,
+            lava_residual_dim=lava_cfg.get('residual_dim', 32) if lava_cfg else 32,
+            lava_qformer_hidden_dim=qformer_cfg.get('hidden_dim', 256) if qformer_cfg else 256,
+            lava_qformer_num_queries=qformer_cfg.get('num_queries', 1) if qformer_cfg else 1,
+            lava_qformer_num_layers=qformer_cfg.get('num_layers', 2) if qformer_cfg else 2,
+            lava_qformer_num_heads=qformer_cfg.get('num_heads', 4) if qformer_cfg else 4,
+            lava_logsig_depth=lava_cfg.get('logsig_depth', 2) if lava_cfg else 2,
         )
         return model
 
@@ -138,8 +156,11 @@ class VLAWrapper(nn.Module):
                  device,
                  dtype,
                  norm_stats_path,
+                 norm_stats_key="robotwin2",
                  train_config=None,
                  future_feat_target_layer=-1,
+                 lava_target_layer=-4,
+                 vision_encode_batch_size=None,
                  ):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -149,6 +170,9 @@ class VLAWrapper(nn.Module):
         self.include_cls_register = include_cls_register
         self.num_register_tokens = num_register_tokens
         self.future_feat_target_layer = future_feat_target_layer
+        self.lava_target_layer = lava_target_layer
+        self.norm_stats_key = norm_stats_key
+        self.vision_encode_batch_size = vision_encode_batch_size
 
         self.device = device
         self.dtype = dtype
@@ -163,6 +187,10 @@ class VLAWrapper(nn.Module):
             self.vel_weight_sigma = train_config['vel_weight_sigma']
             self.use_future_feat = train_config.get('use_future_feat', False)
             self.lambda_future_feat = train_config.get('lambda_future_feat', 0.0)
+            self.use_lava = train_config.get('use_lava', False)
+            self.lambda_lava = train_config.get('lambda_lava', 0.0)
+            self.lava_temperature = train_config.get('lava_temperature', 0.07)
+            self.lava_order_negative = train_config.get('lava_order_negative', True)
         else:
             # Inference-mode defaults
             self.time_mu = 0.0
@@ -172,6 +200,10 @@ class VLAWrapper(nn.Module):
             self.vel_weight_sigma = 0.01
             self.use_future_feat = False
             self.lambda_future_feat = 0.0
+            self.use_lava = False
+            self.lambda_lava = 0.0
+            self.lava_temperature = 0.07
+            self.lava_order_negative = True
 
         logger.info(f"VLAWrapper initialized. feat_layers={self.feat_layers}, "
                     f"include_cls_register={self.include_cls_register}")
@@ -179,13 +211,24 @@ class VLAWrapper(nn.Module):
         # Load normalization stats
         self.load_norm_stats(norm_stats_path)
 
+    def train(self, mode=True):
+        """Train policy/LAVA modules while keeping the frozen DINO deterministic."""
+        super().train(mode)
+        self.vision_encoder.eval()
+        return self
+
     def load_norm_stats(self, path):
         """Read JSON and load action / state min/max for normalization"""
         logger.info(f"Loading normalization stats from {path}...")
         with open(path, 'r') as f:
             data = json.load(f)
 
-        stats = data['robotwin2']
+        if self.norm_stats_key not in data:
+            raise KeyError(
+                f"Normalization key '{self.norm_stats_key}' is missing from {path}; "
+                f"available keys: {list(data)}"
+            )
+        stats = data[self.norm_stats_key]
         action_stats = stats['action']
         state_stats = stats['state']
 
@@ -207,30 +250,49 @@ class VLAWrapper(nn.Module):
         Extract DINOv3 multi-layer hidden states.
 
         Args:
-            pixel_values: (B, 3, H, W), ImageNet normalized
+            pixel_values: (B, 3, H, W) or (B, C, 3, H, W), ImageNet normalized.
+                With multiple cameras, each view is encoded independently and the
+                resulting token sequences are concatenated along the token axis.
 
         Returns:
             List[Tensor(B, N, hidden_size)] with length = len(feat_layers), ordered as feat_layers.
             If include_cls_register=True, N = 1 + num_register_tokens + num_patches
             otherwise N = num_patches (the first 1 + num_register_tokens tokens are dropped)
         """
+        num_cameras = None
+        batch_size = pixel_values.shape[0]
+        if pixel_values.dim() == 5:
+            num_cameras = pixel_values.shape[1]
+            pixel_values = pixel_values.flatten(0, 1)
+        elif pixel_values.dim() != 4:
+            raise ValueError(
+                f"pixel_values must have shape (B,3,H,W) or (B,C,3,H,W), got {tuple(pixel_values.shape)}"
+            )
+
         pixel_values = pixel_values.to(self.device, self.dtype)
-        outputs = self.vision_encoder(
-            pixel_values=pixel_values,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        encode_bs = self.vision_encode_batch_size or pixel_values.shape[0]
+        hidden_chunks = None
+        for chunk in pixel_values.split(encode_bs, dim=0):
+            outputs = self.vision_encoder(
+                pixel_values=chunk,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            if hidden_chunks is None:
+                hidden_chunks = [[] for _ in self.feat_layers]
+            for out_idx, layer_idx in enumerate(self.feat_layers):
+                hidden_chunks[out_idx].append(outputs.hidden_states[layer_idx])
         # hidden_states is a tuple of length num_hidden_layers + 1:
         # [0] is the embedding output, [1..num_layers] are the transformer block outputs
         # feat_layer = -1 -> last layer
-        hidden_states = outputs.hidden_states
-
         feats_list = []
-        for layer_idx in self.feat_layers:
-            h = hidden_states[layer_idx]   # (B, 1+R+P, D)
+        for chunks in hidden_chunks:
+            h = torch.cat(chunks, dim=0)   # (B*C, 1+R+P, D)
             if not self.include_cls_register:
                 skip = 1 + self.num_register_tokens
                 h = h[:, skip:, :]
+            if num_cameras is not None:
+                h = h.reshape(batch_size, num_cameras * h.shape[1], h.shape[2])
             feats_list.append(h)
         return feats_list
 
@@ -258,6 +320,34 @@ class VLAWrapper(nn.Module):
         h = h[:, skip:, :]                                          # (B, P, D) patch tokens only
         return h
 
+    @torch.no_grad()
+    def get_evolution_feature_differences(self, evolution_pixel_values):
+        """Encode variable-length frame paths and return raw DINO patch deltas.
+
+        Args:
+            evolution_pixel_values: list[(L+1, 3, H, W)]
+        Returns:
+            list[(L, num_patches, dino_hidden_size)] in the original sample order
+        """
+        if not evolution_pixel_values:
+            return []
+        frame_counts = [frames.shape[0] for frames in evolution_pixel_values]
+        flat_frames = torch.cat(evolution_pixel_values, dim=0).to(self.device, self.dtype)
+        encode_bs = self.vision_encode_batch_size or flat_frames.shape[0]
+        feature_chunks = []
+        for chunk in flat_frames.split(encode_bs, dim=0):
+            outputs = self.vision_encoder(
+                pixel_values=chunk,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            features = outputs.hidden_states[self.lava_target_layer]
+            features = features[:, 1 + self.num_register_tokens:, :]
+            feature_chunks.append(features)
+        flat_features = torch.cat(feature_chunks, dim=0)
+        paths = flat_features.split(frame_counts, dim=0)
+        return [path[1:] - path[:-1] for path in paths]
+
     def _normalize_tensor(self, x, min_val, max_val):
         min_v = min_val.to(device=x.device, dtype=x.dtype)
         max_v = max_val.to(device=x.device, dtype=x.dtype)
@@ -284,7 +374,7 @@ class VLAWrapper(nn.Module):
         action = (norm_action + 1) / 2 * denominator + action_min
         return action
 
-    def forward(self, batch):
+    def forward(self, batch, lava_weight=None):
         """Forward pass and loss computation"""
         # 1. Vision features (multi-layer DINO)
         pixel_values = batch['pixel_values']      # (B, 3, H, W)
@@ -313,6 +403,21 @@ class VLAWrapper(nn.Module):
         if self.use_future_feat and batch.get('future_pixel_values') is not None:
             future_feat_target = self.get_future_target_features(batch['future_pixel_values'])
 
+        # 4c. Multi-scale world evolution targets. DINO stays frozen/no-grad;
+        # gradients start at the trainable World Residual Q-Former.
+        world_feature_differences = None
+        if self.use_lava and batch.get('evolution_pixel_values') is not None:
+            world_feature_differences = self.get_evolution_feature_differences(
+                batch['evolution_pixel_values'])
+            for differences, scale in zip(
+                    world_feature_differences, batch['evolution_scales'].tolist()):
+                if differences.shape[0] != scale:
+                    raise ValueError(
+                        f"LAVA path has {differences.shape[0]} transitions but scale={scale}")
+
+        if lava_weight is None:
+            lava_weight = self.lambda_lava
+
         # 5. Flow Matching Loss
         loss, info_dic = calc_flow_matching_loss(
             self.action_model,
@@ -329,6 +434,14 @@ class VLAWrapper(nn.Module):
             future_feat_target=future_feat_target,
             use_future_feat=self.use_future_feat,
             lambda_future_feat=self.lambda_future_feat,
+            world_feature_differences=world_feature_differences,
+            lava_batch_indices=batch.get('evolution_batch_indices'),
+            lava_interval_starts=batch.get('evolution_starts'),
+            lava_interval_scales=batch.get('evolution_scales'),
+            use_lava=self.use_lava,
+            lambda_lava=lava_weight,
+            lava_temperature=self.lava_temperature,
+            lava_order_negative=self.lava_order_negative,
         )
 
         return loss, info_dic
