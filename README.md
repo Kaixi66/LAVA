@@ -20,9 +20,10 @@ $$
 $$
 
 A learnable-query World Residual encoder compresses every patch-level change to
-a 32-dimensional residual. On the action side, LAVA uses the final-normalized
-action hidden state immediately before the action output head and a shared MLP
-projector. The alignment is offset by one step:
+a 32-dimensional residual. On the action side, LAVA uses the hidden state after
+Action Expert block 6 and a shared MLP projector; the policy itself still runs
+through all 12 blocks, final normalization, and the action head. The alignment
+is offset by one step:
 
 $$
 \Delta Z_i \longleftrightarrow h_{i+1},
@@ -41,7 +42,7 @@ $$
 \mathcal L = \mathcal L_{\mathrm{flow}} + 0.5\,\mathcal L_{\mathrm{future}} + \lambda_{\mathrm{LAVA}}(s)\,\mathcal L_{\mathrm{LAVA}}.
 $$
 
-where $\lambda_{\mathrm{LAVA}}$ linearly warms from 0 to 0.1 over the first
+where $\lambda_{\mathrm{LAVA}}$ linearly warms from 0 to 0.01 over the first
 5% of optimizer steps.
 
 ## Default LAVA configuration
@@ -62,19 +63,27 @@ model:
     logsig_depth: 2
 
 training:
-  lambda_lava: 0.1
+  lambda_lava: 0.01
   lava_temperature: 0.07
   lava_scales: [1, 2, 4, 8, 16]
   lava_sample_ratio: 0.25
   lava_scale_sampling: uniform
+  lava_sampling_balance: none
   lava_warmup_ratio: 0.05
   lava_order_negative: true
+  lava_grad_diagnostics_interval: 200
 ```
+
+`lava_sampling_balance: task_episode` keeps the base flow/future DataLoader
+frame-uniform while equalizing the expected number of LAVA paths across tasks
+and then across episodes within each task. The provided RoboTwin Slurm scripts
+enable this mode explicitly and write an actual per-task sampling audit after
+every epoch.
 
 The fixed method choices are:
 
 - frozen DINOv3 targets from layer `-4`;
-- final-norm, pre-head action hidden states;
+- Action Expert block-6 hidden states (the policy still executes all 12 blocks);
 - visual differences `Z[t+1] - Z[t]`;
 - normalized time augmentation;
 - one-way Action-to-World InfoNCE;
@@ -153,15 +162,21 @@ memory. The most important diagnostics are:
 
 ```text
 Loss_Flow, Loss_Future, Loss_LAVA, Lambda_LAVA
+Loss_Base, Weighted_LAVA, LAVA_Base_Ratio
 Pos_Sim, Negative_Sim, Shuffle_Sim, Order_Margin, Retrieval_Acc
+Same_Task_Neg_Sim, Cross_Task_Neg_Sim, Task_Shortcut_Gap
 Loss_S1/S2/S4/S8/S16
 Pos_Sim_S1/S2/S4/S8/S16
 Order_Margin_S1/S2/S4/S8/S16
+Action/World_LogSig_L1/L2_Raw_Norm, Action/World_LogSig_L2_L1_Ratio
 Grad_Norm, Grad_Norm_LAVA_Branch
+Grad_Cos_Shared, Grad_Norm_Base/LAVA_Shared, Weighted_Grad_Ratio
 ```
 
 `Order_Margin` is the paired cosine difference between the correctly ordered
-world path and its adjacent-swap negative. Scale 1 has no order negative.
+world path and a full-shuffle derangement that moves every path position.
+Scale 1 has no order negative. Shared-gradient diagnostics run every 200
+optimizer steps; their CSV fields are `nan` on non-diagnostic steps.
 
 ## Tests
 

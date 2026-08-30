@@ -132,6 +132,7 @@ OVERRIDES=(
   "training.lava_scales=${LAVA_SCALES}"
   "training.lava_temperature=${LAVA_TEMPERATURE}"
   "training.lava_sample_ratio=${LAVA_SAMPLE_RATIO}"
+  "training.lava_sampling_balance=${LAVA_SAMPLING_BALANCE}"
   "training.lava_warmup_ratio=${LAVA_WARMUP_RATIO}"
   "training.lava_scale_sampling=${LAVA_SCALE_SAMPLING}"
   "training.lava_order_negative=${LAVA_ORDER_NEGATIVE}"
@@ -146,7 +147,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "Job ${SLURM_JOB_ID} | run ${RUN_NAME} | ${STAGE} | task set ${TASK_SET}"
-echo "LAVA lambda=${LAMBDA_LAVA} scales=${LAVA_SCALES} tau=${LAVA_TEMPERATURE} ratio=${LAVA_SAMPLE_RATIO}"
+echo "LAVA lambda=${LAMBDA_LAVA} scales=${LAVA_SCALES} tau=${LAVA_TEMPERATURE} ratio=${LAVA_SAMPLE_RATIO} balance=${LAVA_SAMPLING_BALANCE}"
 echo "Output: ${RUN_SAVE_DIR}"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 

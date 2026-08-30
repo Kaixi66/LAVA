@@ -1,11 +1,13 @@
 import os
 import sys
+import json
 import random
 import torch
 import numpy as np
 import logging
 import argparse
 import time
+from collections import Counter
 from datetime import datetime
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -38,6 +40,9 @@ class LossLogger:
         ("Loss_Future", "loss_future_feat", ".6f"),
         ("Loss_LAVA", "loss_lava", ".6f"),
         ("Lambda_LAVA", "lambda_lava", ".6f"),
+        ("Loss_Base", "loss_base", ".6f"),
+        ("Weighted_LAVA", "weighted_lava", ".6f"),
+        ("LAVA_Base_Ratio", "lava_base_ratio", ".6f"),
         ("Pos_Sim", "pos_sim", ".6f"),
         ("Negative_Sim", "negative_sim", ".6f"),
         ("Shuffle_Sim", "shuffle_sim", ".6f"),
@@ -45,13 +50,45 @@ class LossLogger:
         ("Retrieval_Acc", "retrieval_acc", ".6f"),
         ("Action_Pair_Sim", "action_pair_sim", ".6f"),
         ("World_Pair_Sim", "world_pair_sim", ".6f"),
+        ("Same_Task_Neg_Sim", "same_task_negative_sim", ".6f"),
+        ("Cross_Task_Neg_Sim", "cross_task_negative_sim", ".6f"),
+        ("Task_Shortcut_Gap", "task_shortcut_gap", ".6f"),
+        # Action execution and alignment-tap health (existing-forward reductions)
+        ("Loss_Flow_Pos_0_7", "loss_flow_pos_0_7", ".6f"),
+        ("Loss_Flow_Pos_8_15", "loss_flow_pos_8_15", ".6f"),
+        ("Loss_Flow_Pos_16_31", "loss_flow_pos_16_31", ".6f"),
+        ("Loss_Flow_Executed", "loss_flow_executed", ".6f"),
+        ("Tap_Final_Cos", "tap_final_cos", ".6f"),
+        ("Tap_Final_L2", "tap_final_l2", ".6f"),
+        ("Tap_Hidden_Norm", "tap_hidden_norm", ".6f"),
+        ("Tap_Hidden_Std", "tap_hidden_std", ".6f"),
+        ("Final_Hidden_Norm", "final_hidden_norm", ".6f"),
+        ("Final_Hidden_Std", "final_hidden_std", ".6f"),
         # Representation health
         ("Raw_Change_Norm", "raw_change_norm", ".6f"),
         ("Raw_Change_Std", "raw_change_std", ".6f"),
+        ("Raw_Change_Norm_CV", "raw_change_norm_cv", ".6f"),
+        ("InputNorm_Change_Norm", "input_norm_change_norm", ".6f"),
+        ("InputNorm_Change_Norm_CV", "input_norm_change_norm_cv", ".6f"),
+        ("Raw_InputNorm_Norm_Corr", "raw_input_norm_norm_corr", ".6f"),
+        ("Raw_WorldResidual_Norm_Corr", "raw_world_residual_norm_corr", ".6f"),
         ("World_Residual_Norm", "world_residual_norm", ".6f"),
         ("World_Residual_Std", "world_residual_std", ".6f"),
         ("Action_Residual_Norm", "action_residual_norm", ".6f"),
         ("Action_Residual_Std", "action_residual_std", ".6f"),
+        # Raw LogSig levels (normalization behavior itself is unchanged)
+        ("Action_LogSig_L1_Raw_Norm", "action_logsig_l1_raw_norm", ".6f"),
+        ("Action_LogSig_L2_Raw_Norm", "action_logsig_l2_raw_norm", ".6f"),
+        ("Action_LogSig_L2_L1_Ratio", "action_logsig_l2_l1_ratio", ".6f"),
+        ("World_LogSig_L1_Raw_Norm", "world_logsig_l1_raw_norm", ".6f"),
+        ("World_LogSig_L2_Raw_Norm", "world_logsig_l2_raw_norm", ".6f"),
+        ("World_LogSig_L2_L1_Ratio", "world_logsig_l2_l1_ratio", ".6f"),
+        *((f"Action_LogSig_L2_L1_Ratio_S{scale}",
+           f"action_logsig_l2_l1_ratio_s{scale}", ".6f")
+          for scale in (2, 4, 8, 16)),
+        *((f"World_LogSig_L2_L1_Ratio_S{scale}",
+           f"world_logsig_l2_l1_ratio_s{scale}", ".6f")
+          for scale in (2, 4, 8, 16)),
         # Per-scale LAVA behavior
         *((f"Loss_S{scale}", f"loss_s{scale}", ".6f") for scale in (1, 2, 4, 8, 16)),
         *((f"Pos_Sim_S{scale}", f"pos_sim_s{scale}", ".6f") for scale in (1, 2, 4, 8, 16)),
@@ -70,6 +107,14 @@ class LossLogger:
         # Sampling, optimization, and system health
         ("LAVA_Samples", "lava_sample_count", "d"),
         ("Order_Negatives", "lava_order_negative_count", "d"),
+        ("LAVA_Coverage_Pos_1_8", "lava_coverage_pos_1_8", ".6f"),
+        ("LAVA_Coverage_Pos_9_16", "lava_coverage_pos_9_16", ".6f"),
+        ("LAVA_Coverage_Pos_17_24", "lava_coverage_pos_17_24", ".6f"),
+        ("LAVA_Coverage_Pos_25_31", "lava_coverage_pos_25_31", ".6f"),
+        ("LAVA_Position_Mean", "lava_position_mean", ".4f"),
+        ("LAVA_Position_Min", "lava_position_min", ".0f"),
+        ("LAVA_Position_Max", "lava_position_max", ".0f"),
+        ("LAVA_Executed_Horizon_Ratio", "lava_executed_horizon_ratio", ".6f"),
         ("Scale_Mean", "lava_scale_mean", ".4f"),
         ("Scale_Min", "lava_scale_min", ".0f"),
         ("Scale_Max", "lava_scale_max", ".0f"),
@@ -78,11 +123,44 @@ class LossLogger:
         ("LR", "learning_rate", ".8e"),
         ("Grad_Norm", "grad_norm", ".6f"),
         ("Grad_Norm_LAVA_Branch", "lava_branch_grad_norm", ".6f"),
+        ("Grad_Cos_Shared", "grad_cos_shared", ".6f"),
+        ("Grad_Norm_Base_Shared", "grad_norm_base_shared", ".6f"),
+        ("Grad_Norm_LAVA_Shared", "grad_norm_lava_shared", ".6f"),
+        ("Weighted_Grad_Ratio", "weighted_grad_ratio", ".6f"),
+        *((f"Grad_Cos_{label}", f"grad_cos_{key}", ".6f")
+          for label, key in (("Input", "input"), ("B1_4", "b1_4"),
+                             ("B5_8", "b5_8"), ("B9_10", "b9_10"),
+                             ("B11_12", "b11_12"))),
+        *((f"Grad_Norm_Base_{label}", f"grad_norm_base_{key}", ".6f")
+          for label, key in (("Input", "input"), ("B1_4", "b1_4"),
+                             ("B5_8", "b5_8"), ("B9_10", "b9_10"),
+                             ("B11_12", "b11_12"))),
+        *((f"Grad_Norm_LAVA_{label}", f"grad_norm_lava_{key}", ".6f")
+          for label, key in (("Input", "input"), ("B1_4", "b1_4"),
+                             ("B5_8", "b5_8"), ("B9_10", "b9_10"),
+                             ("B11_12", "b11_12"))),
+        *((f"Weighted_Grad_Ratio_{label}", f"weighted_grad_ratio_{key}", ".6f")
+          for label, key in (("Input", "input"), ("B1_4", "b1_4"),
+                             ("B5_8", "b5_8"), ("B9_10", "b9_10"),
+                             ("B11_12", "b11_12"))),
         ("Update_Time_s", "update_time_s", ".4f"),
         ("Data_Time_s", "data_time_s", ".4f"),
         ("GPU_Peak_Allocated_GB", "gpu_peak_allocated_gb", ".4f"),
         ("GPU_Peak_Reserved_GB", "gpu_peak_reserved_gb", ".4f"),
     )
+
+    NAN_DEFAULT_KEYS = {
+        "same_task_negative_sim", "cross_task_negative_sim", "task_shortcut_gap",
+        "raw_input_norm_norm_corr", "raw_world_residual_norm_corr",
+        "grad_cos_shared", "grad_norm_base_shared", "grad_norm_lava_shared",
+        "weighted_grad_ratio",
+        *(f"grad_cos_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
+        *(f"grad_norm_base_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
+        *(f"grad_norm_lava_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
+        *(f"weighted_grad_ratio_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
+        *(f"action_logsig_l2_l1_ratio_s{scale}" for scale in (2, 4, 8, 16)),
+        *(f"world_logsig_l2_l1_ratio_s{scale}" for scale in (2, 4, 8, 16)),
+    }
 
     def __init__(self, log_dir="log/loss"):
         os.makedirs(log_dir, exist_ok=True)
@@ -96,7 +174,8 @@ class LossLogger:
     def log(self, epoch, step, global_step, loss, info):
         values = [str(epoch), str(step), str(global_step), f"{loss:.6f}"]
         for _, key, format_spec in self.METRICS:
-            value = info.get(key, 0)
+            default = float("nan") if key in self.NAN_DEFAULT_KEYS else 0
+            value = info.get(key, default)
             values.append(format(int(value), format_spec) if format_spec == "d"
                           else format(float(value), format_spec))
         with open(self.log_file, 'a') as f:
@@ -120,6 +199,7 @@ def build_train_config_from_yaml(cfg):
         'lambda_lava': t.get('lambda_lava', 0.0),
         'lava_temperature': t.get('lava_temperature', 0.07),
         'lava_order_negative': t.get('lava_order_negative', True),
+        'action_execution_horizon': cfg.common.get('action_execution_horizon', 16),
     }
 
 
@@ -132,6 +212,130 @@ def parameter_grad_norm(parameters):
     if not squared_norms:
         return 0.0
     return torch.stack(squared_norms).sum().sqrt().item()
+
+
+def should_run_lava_grad_diagnostics(next_global_step, is_update_boundary,
+                                     interval):
+    return (is_update_boundary and interval > 0
+            and next_global_step % interval == 0)
+
+
+def build_lava_gradient_parameter_groups(model):
+    """Select fixed architectural bands for localized conflict diagnostics."""
+    named_parameters = list(model.named_parameters())
+
+    def matching(prefixes):
+        return [parameter for name, parameter in named_parameters
+                if parameter.requires_grad and name.startswith(prefixes)]
+
+    return {
+        "input": matching((
+            "time_mlp.", "action_proj.", "proprio_proj.",
+            "dino_adapters.", "concat_fusion.", "task_cond_proj.",
+            "type_emb_", "register_tokens")),
+        "b1_4": matching(tuple(f"blocks.{index}." for index in range(0, 4))),
+        "b5_8": matching(tuple(f"blocks.{index}." for index in range(4, 8))),
+        "b9_10": matching(tuple(f"blocks.{index}." for index in range(8, 10))),
+        "b11_12": matching(tuple(f"blocks.{index}." for index in range(10, 12))),
+    }
+
+
+def compute_shared_gradient_diagnostics(loss_base, loss_lava, parameters,
+                                        lava_weight, eps=1e-12,
+                                        parameter_groups=None):
+    """Compare base/LAVA gradients with one pair of autograd.grad calls.
+
+    The global result keeps the original shared-parameter definition. Optional
+    groups reuse those same gradient tensors, so localized diagnostics add no
+    backward traversals.
+    """
+    nan_result = {
+        "grad_cos_shared": float("nan"),
+        "grad_norm_base_shared": float("nan"),
+        "grad_norm_lava_shared": float("nan"),
+        "weighted_grad_ratio": float("nan"),
+    }
+    if (loss_base is None or loss_lava is None
+            or not loss_base.requires_grad or not loss_lava.requires_grad):
+        return nan_result
+
+    parameters = [parameter for parameter in parameters if parameter.requires_grad]
+    base_grads = torch.autograd.grad(
+        loss_base, parameters, retain_graph=True, allow_unused=True)
+    lava_grads = torch.autograd.grad(
+        loss_lava, parameters, retain_graph=True, allow_unused=True)
+
+    dot = None
+    base_squared = None
+    lava_squared = None
+    for base_grad, lava_grad in zip(base_grads, lava_grads):
+        if base_grad is None or lava_grad is None:
+            continue
+        base_float = base_grad.detach().float()
+        lava_float = lava_grad.detach().float()
+        current_dot = (base_float * lava_float).sum()
+        current_base_squared = base_float.square().sum()
+        current_lava_squared = lava_float.square().sum()
+        dot = current_dot if dot is None else dot + current_dot
+        base_squared = (current_base_squared if base_squared is None
+                        else base_squared + current_base_squared)
+        lava_squared = (current_lava_squared if lava_squared is None
+                        else lava_squared + current_lava_squared)
+
+    if dot is None:
+        result = dict(nan_result)
+    else:
+        base_norm = base_squared.sqrt()
+        lava_norm = lava_squared.sqrt()
+        denominator = base_norm * lava_norm
+        grad_cos = (dot / denominator).item() if denominator > eps else float("nan")
+        weighted_ratio = (
+            abs(float(lava_weight)) * lava_norm / base_norm).item() \
+            if base_norm > eps else float("nan")
+        result = {
+            "grad_cos_shared": grad_cos,
+            "grad_norm_base_shared": base_norm.item(),
+            "grad_norm_lava_shared": lava_norm.item(),
+            "weighted_grad_ratio": weighted_ratio,
+        }
+
+    if not parameter_groups:
+        return result
+
+    parameter_to_index = {id(parameter): index
+                          for index, parameter in enumerate(parameters)}
+    for group_name, group_parameters in parameter_groups.items():
+        indices = [parameter_to_index[id(parameter)] for parameter in group_parameters
+                   if id(parameter) in parameter_to_index]
+        group_base_squared = None
+        group_lava_squared = None
+        group_dot = None
+        for index in indices:
+            base_grad, lava_grad = base_grads[index], lava_grads[index]
+            if base_grad is not None:
+                value = base_grad.detach().float().square().sum()
+                group_base_squared = value if group_base_squared is None else group_base_squared + value
+            if lava_grad is not None:
+                value = lava_grad.detach().float().square().sum()
+                group_lava_squared = value if group_lava_squared is None else group_lava_squared + value
+            if base_grad is not None and lava_grad is not None:
+                value = (base_grad.detach().float() * lava_grad.detach().float()).sum()
+                group_dot = value if group_dot is None else group_dot + value
+
+        base_norm = (group_base_squared.sqrt() if group_base_squared is not None
+                     else loss_base.new_tensor(0.0))
+        lava_norm = (group_lava_squared.sqrt() if group_lava_squared is not None
+                     else loss_base.new_tensor(0.0))
+        denominator = base_norm * lava_norm
+        result[f"grad_cos_{group_name}"] = (
+            (group_dot / denominator).item()
+            if group_dot is not None and denominator > eps else float("nan"))
+        result[f"grad_norm_base_{group_name}"] = base_norm.item()
+        result[f"grad_norm_lava_{group_name}"] = lava_norm.item()
+        result[f"weighted_grad_ratio_{group_name}"] = (
+            (abs(float(lava_weight)) * lava_norm / base_norm).item()
+            if base_norm > eps else float("nan"))
+    return result
 
 
 if __name__ == "__main__":
@@ -212,15 +416,24 @@ if __name__ == "__main__":
     use_lava = bool(lava_cfg.get('enabled', False)) if lava_cfg else False
     lambda_lava_max = float(config.training.get('lambda_lava', 0.0))
     lava_warmup_ratio = float(config.training.get('lava_warmup_ratio', 0.0))
+    lava_grad_diagnostics_interval = int(
+        config.training.get('lava_grad_diagnostics_interval', 0))
     if not 0.0 <= lava_warmup_ratio <= 1.0:
         raise ValueError(f"lava_warmup_ratio must be in [0,1], got {lava_warmup_ratio}")
+    if lava_grad_diagnostics_interval < 0:
+        raise ValueError(
+            "lava_grad_diagnostics_interval must be non-negative, got "
+            f"{lava_grad_diagnostics_interval}")
     if use_lava:
         logger.info(
             f"LAVA: lambda={lambda_lava_max}, warmup_ratio={lava_warmup_ratio}, "
+            f"action_tap={lava_cfg.get('action_target_layer', 'final')}, "
             f"temperature={config.training.lava_temperature}, "
             f"scales={list(config.training.lava_scales)}, "
             f"sample_ratio={config.training.lava_sample_ratio}, "
-            f"order_negative={config.training.lava_order_negative}")
+            f"sampling_balance={config.training.get('lava_sampling_balance', 'none')}, "
+            f"order_negative={config.training.lava_order_negative}, "
+            f"grad_diagnostics_every={lava_grad_diagnostics_interval} steps")
 
     # =========================================================================
     # 2. Dataset / DataLoader
@@ -314,6 +527,7 @@ if __name__ == "__main__":
     ]
     if use_lava and not lava_branch_parameters:
         raise RuntimeError("LAVA is enabled but no lava_* trainable parameters were found")
+    lava_gradient_parameter_groups = build_lava_gradient_parameter_groups(action_model)
 
     optimizer_steps_per_epoch = max(1, len(train_dataloader) // grad_accum_steps)
     total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
@@ -402,6 +616,7 @@ if __name__ == "__main__":
         update_window_start = start_time
         update_window_data_time = 0.0
         update_window_scales = []
+        epoch_lava_task_counts = Counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -410,6 +625,10 @@ if __name__ == "__main__":
             update_window_data_time += batch_ready_time - last_iteration_end
             if batch.get('evolution_scales') is not None:
                 update_window_scales.extend(batch['evolution_scales'].tolist())
+            if (batch.get('evolution_batch_indices') is not None
+                    and batch.get('task_name') is not None):
+                for batch_index in batch['evolution_batch_indices'].tolist():
+                    epoch_lava_task_counts[str(batch['task_name'][batch_index])] += 1
             if lava_warmup_steps > 0:
                 lava_weight = lambda_lava_max * min(
                     1.0, float(global_step + 1) / lava_warmup_steps)
@@ -418,6 +637,27 @@ if __name__ == "__main__":
             with torch.amp.autocast('cuda', dtype=dtype):
                 loss, info_dic = model(batch, lava_weight=lava_weight)
                 loss = loss / grad_accum_steps
+
+            loss_base_tensor = info_dic.pop('_loss_base_tensor', None)
+            loss_lava_tensor = info_dic.pop('_loss_lava_tensor', None)
+            is_update_boundary = (step + 1) % grad_accum_steps == 0
+            run_grad_diagnostics = (
+                use_lava
+                and info_dic.get('lava_sample_count', 0) > 0
+                and should_run_lava_grad_diagnostics(
+                    global_step + 1, is_update_boundary,
+                    lava_grad_diagnostics_interval))
+            grad_diagnostics = {
+                'grad_cos_shared': float('nan'),
+                'grad_norm_base_shared': float('nan'),
+                'grad_norm_lava_shared': float('nan'),
+                'weighted_grad_ratio': float('nan'),
+            }
+            if run_grad_diagnostics:
+                grad_diagnostics = compute_shared_gradient_diagnostics(
+                    loss_base_tensor, loss_lava_tensor,
+                    action_model.parameters(), lava_weight,
+                    parameter_groups=lava_gradient_parameter_groups)
 
             if not torch.isfinite(loss.detach()).all():
                 raise FloatingPointError(
@@ -451,6 +691,7 @@ if __name__ == "__main__":
                     'learning_rate': current_lr,
                     'grad_norm': grad_norm,
                     'lava_branch_grad_norm': lava_branch_grad_norm,
+                    **grad_diagnostics,
                     'update_time_s': time.time() - update_window_start,
                     'data_time_s': update_window_data_time,
                     'lava_scale_mean': scale_mean,
@@ -488,6 +729,10 @@ if __name__ == "__main__":
                             f"NegSim: {info_dic.get('negative_sim', 0.0):.4f} "
                             f"ShuffleSim: {info_dic.get('shuffle_sim', 0.0):.4f} "
                             f"OrderMargin: {info_dic.get('order_margin', 0.0):.4f} "
+                            f"LAVA/Base: {info_dic.get('lava_base_ratio', 0.0):.3f} "
+                            f"FlowExec: {info_dic.get('loss_flow_executed', float('nan')):.4f} "
+                            f"TapFinalCos: {info_dic.get('tap_final_cos', float('nan')):.3f} "
+                            f"TaskGap: {info_dic.get('task_shortcut_gap', float('nan')):.3f} "
                             f"Retrieval: {info_dic.get('retrieval_acc', 0.0):.3f} "
                             f"RawChange: {info_dic.get('raw_change_norm', 0.0):.3f} "
                             f"WStd: {info_dic.get('world_residual_std', 0.0):.3f} "
@@ -500,6 +745,12 @@ if __name__ == "__main__":
                             f"4:{runtime_info['lava_scale_4_count']}/"
                             f"8:{runtime_info['lava_scale_8_count']}/"
                             f"16:{runtime_info['lava_scale_16_count']} ")
+                    if run_grad_diagnostics:
+                        log_msg += (
+                            f"GradCos: {grad_diagnostics['grad_cos_shared']:.3f} "
+                            f"GradCos9_10: {grad_diagnostics.get('grad_cos_b9_10', float('nan')):.3f} "
+                            f"WeightedGradRatio: "
+                            f"{grad_diagnostics['weighted_grad_ratio']:.3f} ")
                     log_msg += (
                         f"GradNorm: {grad_norm:.3f} "
                         f"LAVABranchGrad: {lava_branch_grad_norm:.3f} "
@@ -524,6 +775,37 @@ if __name__ == "__main__":
         avg_loss = epoch_loss / max(batches_seen, 1)
         elapsed = time.time() - start_time
         logger.info(f"=== Epoch {epoch+1} Completed. Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s ===")
+
+        if use_lava and epoch_lava_task_counts:
+            sampling_total = sum(epoch_lava_task_counts.values())
+            sampling_counts = dict(sorted(epoch_lava_task_counts.items()))
+            sampling_fractions = {
+                task_name: count / sampling_total
+                for task_name, count in sampling_counts.items()
+            }
+            nonzero_counts = list(sampling_counts.values())
+            sampling_audit = {
+                'epoch': epoch + 1,
+                'sampling_balance': str(
+                    config.training.get('lava_sampling_balance', 'none')),
+                'total_lava_samples': sampling_total,
+                'task_counts': sampling_counts,
+                'task_fractions': sampling_fractions,
+                'max_min_count_ratio': (
+                    max(nonzero_counts) / min(nonzero_counts)
+                    if nonzero_counts else float('nan')),
+            }
+            sampling_audit_path = os.path.join(
+                run_save_dir, 'log', f'lava_sampling_epoch_{epoch + 1:03d}.json')
+            with open(sampling_audit_path, 'w', encoding='utf-8') as audit_file:
+                json.dump(sampling_audit, audit_file, indent=2, sort_keys=True)
+            logger.info(
+                "LAVA sampling audit epoch %d: total=%d task_counts=%s max/min=%.3f",
+                epoch + 1,
+                sampling_total,
+                sampling_counts,
+                sampling_audit['max_min_count_ratio'],
+            )
 
         if not args.no_save and ((epoch + 1) % save_interval_epoch == 0 or (epoch + 1) == epochs):
             ckpt_name = (f"checkpoint_{checkpoint_tag}_epoch_{epoch+1}.pt"

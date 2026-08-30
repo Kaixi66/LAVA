@@ -92,6 +92,7 @@ class ModelFactory:
         if use_lava:
             logger.info(
                 f"LAVA ENABLED: target_layer={lava_cfg.get('dino_target_layer', -4)}, "
+                f"action_target_layer={lava_cfg.get('action_target_layer', 'final')}, "
                 f"residual_dim={lava_cfg.get('residual_dim', 32)}, "
                 f"logsig_depth={lava_cfg.get('logsig_depth', 2)}")
 
@@ -135,6 +136,7 @@ class ModelFactory:
             lava_qformer_num_layers=qformer_cfg.get('num_layers', 2) if qformer_cfg else 2,
             lava_qformer_num_heads=qformer_cfg.get('num_heads', 4) if qformer_cfg else 4,
             lava_logsig_depth=lava_cfg.get('logsig_depth', 2) if lava_cfg else 2,
+            lava_action_target_layer=lava_cfg.get('action_target_layer', 'final') if lava_cfg else 'final',
         )
         return model
 
@@ -191,6 +193,8 @@ class VLAWrapper(nn.Module):
             self.lambda_lava = train_config.get('lambda_lava', 0.0)
             self.lava_temperature = train_config.get('lava_temperature', 0.07)
             self.lava_order_negative = train_config.get('lava_order_negative', True)
+            self.action_execution_horizon = int(
+                train_config.get('action_execution_horizon', 16))
         else:
             # Inference-mode defaults
             self.time_mu = 0.0
@@ -204,6 +208,7 @@ class VLAWrapper(nn.Module):
             self.lambda_lava = 0.0
             self.lava_temperature = 0.07
             self.lava_order_negative = True
+            self.action_execution_horizon = 16
 
         logger.info(f"VLAWrapper initialized. feat_layers={self.feat_layers}, "
                     f"include_cls_register={self.include_cls_register}")
@@ -442,6 +447,8 @@ class VLAWrapper(nn.Module):
             lambda_lava=lava_weight,
             lava_temperature=self.lava_temperature,
             lava_order_negative=self.lava_order_negative,
+            action_execution_horizon=self.action_execution_horizon,
+            task_names=batch.get('task_name'),
         )
 
         return loss, info_dic

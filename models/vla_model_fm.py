@@ -205,7 +205,36 @@ class WorldResidualEncoder(nn.Module):
         return self.output_proj(residual)
 
 
-def normalized_logsignature(path_increments, depth=2, eps=1e-6):
+def sample_full_shuffle_permutation(length, device=None):
+    """Sample an order-negative permutation that moves every position."""
+    if length < 2:
+        raise ValueError(f"Full shuffle requires length >= 2, got {length}")
+    if length == 2:
+        return torch.tensor([1, 0], device=device, dtype=torch.long)
+
+    # Sample on CPU so rejection does not introduce repeated GPU sync points.
+    identity = torch.arange(length)
+    while True:
+        permutation = torch.randperm(length)
+        if torch.all(permutation != identity):
+            return permutation.to(device=device)
+
+
+def _raw_logsignature_levels(path_increments):
+    """Return the unnormalized depth-1 and antisymmetric depth-2 levels."""
+    increments = path_increments.float()
+    level_one = increments.sum(dim=0)
+    prefix = increments.cumsum(dim=0) - increments
+    area = 0.5 * torch.einsum("li,lj->ij", prefix, increments)
+    area = area - area.transpose(0, 1)
+    upper = torch.triu_indices(
+        area.shape[0], area.shape[1], offset=1, device=area.device)
+    level_two = area[upper[0], upper[1]]
+    return level_one, level_two
+
+
+def normalized_logsignature(path_increments, depth=2, eps=1e-6,
+                            return_raw_norms=False):
     """Closed-form depth-1/2 log-signature of a piecewise-linear path.
 
     The first and second levels are normalized separately, concatenated, and
@@ -218,19 +247,22 @@ def normalized_logsignature(path_increments, depth=2, eps=1e-6):
         raise ValueError(
             f"path_increments must have shape (L,D) with L >= 1, got {tuple(path_increments.shape)}")
 
-    increments = path_increments.float()
-    level_one = increments.sum(dim=0)
-    level_one = F.normalize(level_one, dim=0, eps=eps)
+    raw_level_one, raw_level_two = _raw_logsignature_levels(path_increments)
+    level_one = F.normalize(raw_level_one, dim=0, eps=eps)
     if depth == 1:
-        return level_one
+        signature = level_one
+    else:
+        level_two = F.normalize(raw_level_two, dim=0, eps=eps)
+        signature = F.normalize(
+            torch.cat((level_one, level_two), dim=0), dim=0, eps=eps)
 
-    prefix = increments.cumsum(dim=0) - increments
-    area = 0.5 * torch.einsum("li,lj->ij", prefix, increments)
-    area = area - area.transpose(0, 1)
-    upper = torch.triu_indices(area.shape[0], area.shape[1], offset=1, device=area.device)
-    level_two = area[upper[0], upper[1]]
-    level_two = F.normalize(level_two, dim=0, eps=eps)
-    return F.normalize(torch.cat((level_one, level_two), dim=0), dim=0, eps=eps)
+    if not return_raw_norms:
+        return signature
+    raw_norms = {
+        "level1_raw_norm": raw_level_one.detach().norm(),
+        "level2_raw_norm": raw_level_two.detach().norm(),
+    }
+    return signature, raw_norms
 
 
 def future_feature_cosine_loss(pred, target):
@@ -340,6 +372,7 @@ class VLAModel(nn.Module):
                  lava_qformer_num_layers=2,
                  lava_qformer_num_heads=4,
                  lava_logsig_depth=2,
+                 lava_action_target_layer="final",
                  ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -357,6 +390,23 @@ class VLAModel(nn.Module):
         self.use_lava = use_lava
         self.lava_residual_dim = lava_residual_dim
         self.lava_logsig_depth = lava_logsig_depth
+        if isinstance(lava_action_target_layer, str):
+            normalized_target = lava_action_target_layer.strip().lower()
+            if normalized_target == "final":
+                self.lava_action_target_layer = "final"
+            elif normalized_target.isdigit():
+                self.lava_action_target_layer = int(normalized_target)
+            else:
+                raise ValueError(
+                    "lava_action_target_layer must be 'final' or a 1-indexed "
+                    f"block number, got {lava_action_target_layer!r}")
+        else:
+            self.lava_action_target_layer = int(lava_action_target_layer)
+        if (self.lava_action_target_layer != "final"
+                and not 1 <= self.lava_action_target_layer <= depth):
+            raise ValueError(
+                f"lava_action_target_layer must be in [1,{depth}] or 'final', "
+                f"got {self.lava_action_target_layer}")
 
         # --- 1. Time Embedding ---
         self.time_mlp = nn.Sequential(
@@ -534,6 +584,7 @@ class VLAModel(nn.Module):
 
         # 5. Transformer Blocks
         state_injected = False
+        lava_action_hidden = None
 
         for i, block in enumerate(self.blocks):
             if i == self.state_inject_start and not state_injected:
@@ -541,11 +592,22 @@ class VLAModel(nn.Module):
                 state_injected = True
 
             x = block(x, t_emb)
+            if (self.use_lava
+                    and self.lava_action_target_layer == i + 1):
+                # A view is sufficient: the following blocks create new tensors,
+                # while LAVA gradients still terminate at this exact block.
+                lava_action_hidden = x[:, :self.action_len, :]
 
         # 6. Output Head
         x = self.final_norm(x)
         x_action_out = x[:, :self.action_len, :]
         final_pred = self.output_proj(x_action_out)
+
+        if self.use_lava and self.lava_action_target_layer == "final":
+            lava_action_hidden = x_action_out
+        if self.use_lava and lava_action_hidden is None:
+            raise RuntimeError(
+                f"Failed to capture LAVA action layer {self.lava_action_target_layer}")
 
         # Evolved observation tokens (all tokens after the action tokens),
         # used as cond tokens for future-feature prediction
@@ -554,15 +616,18 @@ class VLAModel(nn.Module):
         return {
             "final_pred": final_pred,
             "cond_tokens": cond_tokens,
-            # Fixed LAVA representation: final-norm output immediately before
-            # the action output head. Inference ignores this tensor.
-            "action_hidden": x_action_out,
+            # Training-only auxiliary consumers use this tap. The policy output
+            # always continues through every block, final_norm, and output_proj.
+            "action_hidden": (lava_action_hidden
+                              if lava_action_hidden is not None else x_action_out),
+            "final_action_hidden": x_action_out,
         }
 
     def compute_lava_loss(self, action_hidden, world_feature_differences,
                           batch_indices, interval_starts, interval_scales,
                           temperature=0.07, order_negative=True,
-                          flow_timesteps=None):
+                          flow_timesteps=None, task_names=None,
+                          action_execution_horizon=16):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -577,6 +642,9 @@ class VLAModel(nn.Module):
                 "retrieval_acc": 0.0,
                 "action_pair_sim": 0.0,
                 "world_pair_sim": 0.0,
+                "same_task_negative_sim": float("nan"),
+                "cross_task_negative_sim": float("nan"),
+                "task_shortcut_gap": float("nan"),
                 "lava_sample_count": 0,
                 "lava_order_negative_count": 0,
             }
@@ -613,6 +681,10 @@ class VLAModel(nn.Module):
 
         action_signatures = []
         world_signatures = []
+        action_level1_raw_norms = []
+        action_level2_raw_norms = []
+        world_level1_raw_norms = []
+        world_level2_raw_norms = []
         shuffled_signatures = []
         shuffled_action_indices = []
         for sample_idx, (action_path, world_path, scale) in enumerate(zip(
@@ -621,14 +693,20 @@ class VLAModel(nn.Module):
                 (scale, 1), 1.0 / scale, device=action_path.device, dtype=action_path.dtype)
             action_increments = torch.cat((action_path, time_channel), dim=-1)
             world_increments = torch.cat((world_path, time_channel), dim=-1)
-            action_signatures.append(normalized_logsignature(action_increments, self.lava_logsig_depth))
-            world_signatures.append(normalized_logsignature(world_increments, self.lava_logsig_depth))
+            action_signature, action_raw_norms = normalized_logsignature(
+                action_increments, self.lava_logsig_depth, return_raw_norms=True)
+            world_signature, world_raw_norms = normalized_logsignature(
+                world_increments, self.lava_logsig_depth, return_raw_norms=True)
+            action_signatures.append(action_signature)
+            world_signatures.append(world_signature)
+            action_level1_raw_norms.append(action_raw_norms["level1_raw_norm"])
+            action_level2_raw_norms.append(action_raw_norms["level2_raw_norm"])
+            world_level1_raw_norms.append(world_raw_norms["level1_raw_norm"])
+            world_level2_raw_norms.append(world_raw_norms["level2_raw_norm"])
 
             if order_negative and scale >= 2:
-                swap_at = int(torch.randint(scale - 1, (1,), device=world_path.device).item())
-                permutation = torch.arange(scale, device=world_path.device)
-                permutation[swap_at], permutation[swap_at + 1] = (
-                    permutation[swap_at + 1].clone(), permutation[swap_at].clone())
+                permutation = sample_full_shuffle_permutation(
+                    scale, device=world_path.device)
                 shuffled_world = world_path[permutation]
                 shuffled_increments = torch.cat((shuffled_world, time_channel), dim=-1)
                 shuffled_signatures.append(
@@ -642,11 +720,31 @@ class VLAModel(nn.Module):
         labels = torch.arange(sample_count, device=logits.device)
 
         positive_values = positive_world_logits.diagonal()
+        same_task_negative_sim = logits.new_tensor(float("nan"))
+        cross_task_negative_sim = logits.new_tensor(float("nan"))
+        task_shortcut_gap = logits.new_tensor(float("nan"))
         if sample_count > 1:
             off_diagonal = ~torch.eye(sample_count, dtype=torch.bool, device=logits.device)
             negative_sim = positive_world_logits[off_diagonal].mean()
             action_pair_sim = (action_signatures @ action_signatures.transpose(0, 1))[off_diagonal].mean()
             world_pair_sim = (world_signatures @ world_signatures.transpose(0, 1))[off_diagonal].mean()
+            if task_names is not None:
+                if len(task_names) != action_hidden.shape[0]:
+                    raise ValueError(
+                        "task_names must have one entry per action-hidden batch sample")
+                selected_task_names = [task_names[index] for index in batch_indices.tolist()]
+                same_task = torch.tensor([
+                    [left == right for right in selected_task_names]
+                    for left in selected_task_names
+                ], device=logits.device, dtype=torch.bool)
+                same_task &= off_diagonal
+                cross_task = (~same_task) & off_diagonal
+                if same_task.any():
+                    same_task_negative_sim = positive_world_logits[same_task].mean()
+                if cross_task.any():
+                    cross_task_negative_sim = positive_world_logits[cross_task].mean()
+                if torch.isfinite(same_task_negative_sim) and torch.isfinite(cross_task_negative_sim):
+                    task_shortcut_gap = same_task_negative_sim - cross_task_negative_sim
         else:
             negative_sim = logits.new_tensor(0.0)
             action_pair_sim = logits.new_tensor(0.0)
@@ -683,14 +781,85 @@ class VLAModel(nn.Module):
             raw_world = flat_world.float()
             world_residual = flat_world_residuals.float()
             action_residual = flat_action_residuals.float()
+            input_normalized_world = self.lava_world_encoder.input_norm(flat_world).float()
+
+            raw_transition_norm = raw_world.flatten(1).norm(dim=-1)
+            input_norm_transition_norm = input_normalized_world.flatten(1).norm(dim=-1)
+            world_residual_transition_norm = world_residual.norm(dim=-1)
+
+            def coefficient_of_variation(values, eps=1e-12):
+                mean = values.mean()
+                if mean.abs() <= eps:
+                    return values.new_tensor(float("nan"))
+                return values.std(unbiased=False) / mean.abs()
+
+            def pearson_correlation(left, right, eps=1e-12):
+                left_centered = left - left.mean()
+                right_centered = right - right.mean()
+                denominator = left_centered.norm() * right_centered.norm()
+                if denominator <= eps:
+                    return left.new_tensor(float("nan"))
+                return (left_centered * right_centered).sum() / denominator
+
+            action_l1 = torch.stack(action_level1_raw_norms).float()
+            action_l2 = torch.stack(action_level2_raw_norms).float()
+            world_l1 = torch.stack(world_level1_raw_norms).float()
+            world_l2 = torch.stack(world_level2_raw_norms).float()
+            order_eligible = interval_scales >= 2
+
+            def eligible_mean(values):
+                return (values[order_eligible].mean().item()
+                        if order_eligible.any() else float("nan"))
+
+            def eligible_ratio(level_two, level_one):
+                ratios = level_two / level_one.clamp_min(1e-12)
+                return (ratios[order_eligible].mean().item()
+                        if order_eligible.any() else float("nan"))
+
             diagnostics = {
                 "raw_change_norm": raw_world.norm(dim=-1).mean().item(),
                 "raw_change_std": raw_world.std(unbiased=False).item(),
+                "raw_change_norm_cv": coefficient_of_variation(raw_transition_norm).item(),
+                "input_norm_change_norm": input_norm_transition_norm.mean().item(),
+                "input_norm_change_norm_cv": coefficient_of_variation(
+                    input_norm_transition_norm).item(),
+                "raw_input_norm_norm_corr": pearson_correlation(
+                    raw_transition_norm, input_norm_transition_norm).item(),
+                "raw_world_residual_norm_corr": pearson_correlation(
+                    raw_transition_norm, world_residual_transition_norm).item(),
                 "world_residual_norm": world_residual.norm(dim=-1).mean().item(),
                 "world_residual_std": world_residual.std(dim=0, unbiased=False).mean().item(),
                 "action_residual_norm": action_residual.norm(dim=-1).mean().item(),
                 "action_residual_std": action_residual.std(dim=0, unbiased=False).mean().item(),
+                "action_logsig_l1_raw_norm": eligible_mean(action_l1),
+                "action_logsig_l2_raw_norm": eligible_mean(action_l2),
+                "action_logsig_l2_l1_ratio": eligible_ratio(action_l2, action_l1),
+                "world_logsig_l1_raw_norm": eligible_mean(world_l1),
+                "world_logsig_l2_raw_norm": eligible_mean(world_l2),
+                "world_logsig_l2_l1_ratio": eligible_ratio(world_l2, world_l1),
             }
+
+            # LAVA aligns c_r with h_{r+1}. Record where supervision actually
+            # lands in the action chunk without adding another forward pass.
+            supervised_positions = torch.cat([
+                torch.arange(start + 1, start + scale + 1,
+                             device=logits.device, dtype=torch.long)
+                for start, scale in zip(interval_starts.tolist(), lengths)
+            ])
+            position_count = max(1, supervised_positions.numel())
+            for lower, upper in ((1, 8), (9, 16), (17, 24), (25, 31)):
+                in_bucket = ((supervised_positions >= lower)
+                             & (supervised_positions <= upper))
+                diagnostics[f"lava_coverage_pos_{lower}_{upper}"] = (
+                    in_bucket.sum().item() / position_count)
+            diagnostics.update({
+                "lava_position_mean": supervised_positions.float().mean().item(),
+                "lava_position_min": supervised_positions.min().item(),
+                "lava_position_max": supervised_positions.max().item(),
+                "lava_executed_horizon_ratio": (
+                    (supervised_positions < int(action_execution_horizon))
+                    .float().mean().item()),
+            })
 
             for scale in (1, 2, 4, 8, 16):
                 scale_mask = interval_scales == scale
@@ -705,6 +874,19 @@ class VLAModel(nn.Module):
                     diagnostics[f"loss_s{scale}"] = 0.0
                     diagnostics[f"pos_sim_s{scale}"] = 0.0
                     diagnostics[f"order_margin_s{scale}"] = 0.0
+
+            for scale in (2, 4, 8, 16):
+                scale_mask = interval_scales == scale
+                if scale_mask.any():
+                    diagnostics[f"action_logsig_l2_l1_ratio_s{scale}"] = (
+                        (action_l2[scale_mask] / action_l1[scale_mask].clamp_min(1e-12))
+                        .mean().item())
+                    diagnostics[f"world_logsig_l2_l1_ratio_s{scale}"] = (
+                        (world_l2[scale_mask] / world_l1[scale_mask].clamp_min(1e-12))
+                        .mean().item())
+                else:
+                    diagnostics[f"action_logsig_l2_l1_ratio_s{scale}"] = float("nan")
+                    diagnostics[f"world_logsig_l2_l1_ratio_s{scale}"] = float("nan")
 
             timestep_labels = ("t0_025", "t025_050", "t050_075", "t075_100")
             if flow_timesteps is not None:
@@ -734,6 +916,9 @@ class VLAModel(nn.Module):
             "retrieval_acc": retrieval_acc.detach().item(),
             "action_pair_sim": action_pair_sim.detach().item(),
             "world_pair_sim": world_pair_sim.detach().item(),
+            "same_task_negative_sim": same_task_negative_sim.detach().item(),
+            "cross_task_negative_sim": cross_task_negative_sim.detach().item(),
+            "task_shortcut_gap": task_shortcut_gap.detach().item(),
             "lava_sample_count": sample_count,
             "lava_order_negative_count": len(shuffled_action_indices),
         })
@@ -765,6 +950,8 @@ def calc_flow_matching_loss(
     lambda_lava=0.0,
     lava_temperature=0.07,
     lava_order_negative=True,
+    action_execution_horizon=16,
+    task_names=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -816,6 +1003,39 @@ def calc_flow_matching_loss(
     loss_final_per_sample = torch.mean(loss_final_unreduced, dim=(1, 2))
     loss_mse = torch.mean(loss_final_per_sample * weights)
 
+    # These are reductions over an already materialized MSE tensor and add no
+    # model forward/backward work. They expose degradation inside the action
+    # chunk, especially the tokens that are actually executed by the policy.
+    per_token_flow = loss_final_unreduced.mean(dim=-1)
+
+    def weighted_token_range_loss(start, end):
+        end = min(end, per_token_flow.shape[1])
+        if start >= end:
+            return float("nan")
+        value = (per_token_flow[:, start:end] * weights[:, None]).mean()
+        return value.detach().float().item()
+
+    flow_position_diagnostics = {
+        "loss_flow_pos_0_7": weighted_token_range_loss(0, 8),
+        "loss_flow_pos_8_15": weighted_token_range_loss(8, 16),
+        "loss_flow_pos_16_31": weighted_token_range_loss(16, 32),
+        "loss_flow_executed": weighted_token_range_loss(
+            0, int(action_execution_horizon)),
+    }
+
+    with torch.no_grad():
+        tap_hidden = preds["action_hidden"].float()
+        final_hidden = preds["final_action_hidden"].float()
+        tap_final_diagnostics = {
+            "tap_final_cos": F.cosine_similarity(
+                tap_hidden, final_hidden, dim=-1).mean().item(),
+            "tap_final_l2": (tap_hidden - final_hidden).norm(dim=-1).mean().item(),
+            "tap_hidden_norm": tap_hidden.norm(dim=-1).mean().item(),
+            "tap_hidden_std": tap_hidden.std(unbiased=False).item(),
+            "final_hidden_norm": final_hidden.norm(dim=-1).mean().item(),
+            "final_hidden_std": final_hidden.std(unbiased=False).item(),
+        }
+
     # ==================== Future Feature Prediction Loss ====================
     loss_future_feat = torch.tensor(0.0, device=device)
 
@@ -849,10 +1069,16 @@ def calc_flow_matching_loss(
             temperature=lava_temperature,
             order_negative=lava_order_negative,
             flow_timesteps=t,
+            task_names=task_names,
+            action_execution_horizon=action_execution_horizon,
         )
 
     # ==================== Total Loss ====================
-    loss = loss_mse + lambda_future_feat * loss_future_feat + lambda_lava * loss_lava
+    loss_base = loss_mse + lambda_future_feat * loss_future_feat
+    weighted_lava = lambda_lava * loss_lava
+    loss = loss_base + weighted_lava
+    lava_base_ratio = (
+        weighted_lava.detach().float() / loss_base.detach().float().clamp_min(1e-12))
 
     return loss, {
         "pred_v": pred_v_final,
@@ -863,5 +1089,12 @@ def calc_flow_matching_loss(
         "loss_future_feat": loss_future_feat.item() if isinstance(loss_future_feat, torch.Tensor) else loss_future_feat,
         "loss_lava": loss_lava.item() if isinstance(loss_lava, torch.Tensor) else loss_lava,
         "lambda_lava": float(lambda_lava),
+        "loss_base": loss_base.detach().item(),
+        "weighted_lava": weighted_lava.detach().item(),
+        "lava_base_ratio": lava_base_ratio.item(),
+        **flow_position_diagnostics,
+        **tap_final_diagnostics,
+        "_loss_base_tensor": loss_base,
+        "_loss_lava_tensor": loss_lava,
         **lava_diagnostics,
     }

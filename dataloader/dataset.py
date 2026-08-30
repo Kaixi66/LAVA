@@ -68,7 +68,8 @@ class RobotWinTaskDataset(data.Dataset):
                  use_future_feat=False, future_frame_offset=None,
                  task_set="50",
                  use_lava=False, lava_scales=None, lava_sample_ratio=0.25,
-                 lava_scale_sampling="uniform", lava_scale_probs=None):
+                 lava_scale_sampling="uniform", lava_scale_probs=None,
+                 lava_sampling_balance="none"):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -93,6 +94,9 @@ class RobotWinTaskDataset(data.Dataset):
             lava_sample_ratio: probability that a dataset sample receives LAVA supervision
             lava_scale_sampling: "uniform" or "weighted"
             lava_scale_probs: probabilities corresponding to lava_scales in weighted mode
+            lava_sampling_balance: "none" preserves frame-uniform sampling; "task"
+                                   equalizes expected LAVA samples across tasks; and
+                                   "task_episode" also equalizes episodes within each task
         """
         if indices_config is None:
             raise ValueError("indices_config is required")
@@ -135,6 +139,7 @@ class RobotWinTaskDataset(data.Dataset):
         self.lava_sample_ratio = float(lava_sample_ratio)
         self.lava_scale_sampling = str(lava_scale_sampling)
         self.lava_scale_probs = None if lava_scale_probs is None else tuple(float(p) for p in lava_scale_probs)
+        self.lava_sampling_balance = str(lava_sampling_balance).lower()
         if self.use_lava:
             if not 0.0 <= self.lava_sample_ratio <= 1.0:
                 raise ValueError(f"lava_sample_ratio must be in [0,1], got {self.lava_sample_ratio}")
@@ -153,6 +158,10 @@ class RobotWinTaskDataset(data.Dataset):
                     raise ValueError("weighted LAVA scale sampling requires one probability per scale")
                 if any(p < 0 for p in self.lava_scale_probs) or sum(self.lava_scale_probs) <= 0:
                     raise ValueError("lava_scale_probs must be non-negative with a positive sum")
+            if self.lava_sampling_balance not in {"none", "task", "task_episode"}:
+                raise ValueError(
+                    "lava_sampling_balance must be one of 'none', 'task', or "
+                    f"'task_episode', got {self.lava_sampling_balance}")
 
         # Task condition vector directory
         self.task_cond_dir = task_cond_dir
@@ -179,17 +188,129 @@ class RobotWinTaskDataset(data.Dataset):
         # 2. Build the flat index map
         logger.info("Building Index Map for dataset...")
         self._build_index_map()
+        self._build_lava_sampling_probabilities()
 
         if self.use_future_feat:
             logger.info(f"Future-Feat mode ENABLED: will return future frame at offset={self.future_frame_offset}.")
         if self.use_lava:
             logger.info(
                 f"LAVA sampling ENABLED: scales={list(self.lava_scales)}, "
-                f"sample_ratio={self.lava_sample_ratio}, scale_sampling={self.lava_scale_sampling}.")
+                f"sample_ratio={self.lava_sample_ratio}, scale_sampling={self.lava_scale_sampling}, "
+                f"balance={self.lava_sampling_balance}.")
 
-    def _sample_lava_interval(self, local_anchor_idx, total_frames):
+    @staticmethod
+    def _equalized_expected_counts(capacities, requested_total):
+        """Water-fill a target while keeping unsaturated groups equally represented."""
+        capacities = np.asarray(capacities, dtype=np.float64)
+        if capacities.ndim != 1 or np.any(capacities < 0):
+            raise ValueError("capacities must be a one-dimensional non-negative array")
+        target = min(max(float(requested_total), 0.0), float(capacities.sum()))
+        allocation = np.zeros_like(capacities)
+        active = set(np.flatnonzero(capacities > 0).tolist())
+        remaining = target
+        while active and remaining > 0:
+            share = remaining / len(active)
+            saturated = [index for index in active if capacities[index] <= share]
+            if not saturated:
+                for index in active:
+                    allocation[index] = share
+                remaining = 0.0
+                break
+            for index in saturated:
+                allocation[index] = capacities[index]
+                remaining -= capacities[index]
+                active.remove(index)
+        return allocation
+
+    def _build_lava_sampling_probabilities(self):
+        """Precompute per-episode probabilities without changing the base loader."""
+        episode_count = len(self.episode_metadata)
+        self._lava_episode_probabilities = np.full(
+            episode_count, self.lava_sample_ratio, dtype=np.float64)
+        self.lava_sampling_summary = {}
+        if not self.use_lava or self.lava_sampling_balance == "none":
+            return
+
+        min_scale = min(self.lava_scales)
+        eligible_by_episode = np.asarray([
+            max(0, int(meta['length']) - min_scale)
+            for meta in self.episode_metadata
+        ], dtype=np.float64)
+        task_names = sorted({meta['task_name'] for meta in self.episode_metadata})
+        episode_indices_by_task = {
+            task_name: np.asarray([
+                index for index, meta in enumerate(self.episode_metadata)
+                if meta['task_name'] == task_name
+            ], dtype=np.int64)
+            for task_name in task_names
+        }
+        task_capacities = np.asarray([
+            eligible_by_episode[episode_indices_by_task[task_name]].sum()
+            for task_name in task_names
+        ], dtype=np.float64)
+        requested_total = self.lava_sample_ratio * float(eligible_by_episode.sum())
+        task_targets = self._equalized_expected_counts(task_capacities, requested_total)
+
+        probabilities = np.zeros(episode_count, dtype=np.float64)
+        for task_index, task_name in enumerate(task_names):
+            episode_indices = episode_indices_by_task[task_name]
+            episode_capacities = eligible_by_episode[episode_indices]
+            task_target = float(task_targets[task_index])
+            if self.lava_sampling_balance == "task":
+                task_capacity = float(episode_capacities.sum())
+                episode_targets = episode_capacities * (
+                    task_target / task_capacity if task_capacity > 0 else 0.0)
+            else:
+                episode_targets = self._equalized_expected_counts(
+                    episode_capacities, task_target)
+            episode_probabilities = np.divide(
+                episode_targets,
+                episode_capacities,
+                out=np.zeros_like(episode_targets),
+                where=episode_capacities > 0,
+            )
+            probabilities[episode_indices] = episode_probabilities
+            self.lava_sampling_summary[task_name] = {
+                'episodes': int(len(episode_indices)),
+                'eligible_anchors': int(episode_capacities.sum()),
+                'expected_lava_samples': float(episode_targets.sum()),
+                'min_episode_probability': float(episode_probabilities.min()),
+                'max_episode_probability': float(episode_probabilities.max()),
+            }
+
+        if np.any(probabilities < 0) or np.any(probabilities > 1 + 1e-9):
+            raise RuntimeError("Invalid task-balanced LAVA sampling probability")
+        self._lava_episode_probabilities = np.clip(probabilities, 0.0, 1.0)
+        logger.info(
+            "LAVA sampling balance=%s targets %.1f samples/epoch across %d tasks "
+            "(%.1f total).",
+            self.lava_sampling_balance,
+            float(task_targets.max()) if len(task_targets) else 0.0,
+            len(task_names),
+            float(task_targets.sum()),
+        )
+        for task_name in task_names:
+            summary = self.lava_sampling_summary[task_name]
+            logger.info(
+                "  LAVA task=%s episodes=%d eligible=%d expected=%.1f p_episode=[%.4f, %.4f]",
+                task_name,
+                summary['episodes'],
+                summary['eligible_anchors'],
+                summary['expected_lava_samples'],
+                summary['min_episode_probability'],
+                summary['max_episode_probability'],
+            )
+
+    def _sample_lava_interval(self, local_anchor_idx, total_frames, episode_idx=None):
         """Return (start, scale) fully contained in both episode and action chunk."""
-        if not self.use_lava or random.random() >= self.lava_sample_ratio:
+        if not self.use_lava:
+            return None
+        sample_probability = self.lava_sample_ratio
+        if self.lava_sampling_balance != "none":
+            if episode_idx is None:
+                raise ValueError("episode_idx is required for balanced LAVA sampling")
+            sample_probability = float(self._lava_episode_probabilities[episode_idx])
+        if random.random() >= sample_probability:
             return None
         max_transition = min(self.chunk_size - 1, total_frames - 1 - local_anchor_idx)
         available = [scale for scale in self.lava_scales if scale <= max_transition]
@@ -224,6 +345,7 @@ class RobotWinTaskDataset(data.Dataset):
             self.episode_metadata.append({
                 'hdf5_path': path,
                 'task_name': ep_info['task_name'],
+                'split': ep_info.get('split'),
                 'length': length,
                 'global_start': current_offset,
                 'global_end': current_offset + length,
@@ -430,7 +552,8 @@ class RobotWinTaskDataset(data.Dataset):
 
             query_indices, padding_mask = self._get_query_indices(local_anchor_idx, total_frames)
 
-            lava_interval = self._sample_lava_interval(local_anchor_idx, total_frames)
+            lava_interval = self._sample_lava_interval(
+                local_anchor_idx, total_frames, episode_idx=ep_idx)
             if lava_interval is not None:
                 lava_start, lava_scale = lava_interval
                 query_indices['evolution_frames'] = list(range(
@@ -479,6 +602,8 @@ class RobotWinTaskDataset(data.Dataset):
                 'pixel_values': pixel_values,
                 'state_mask': data_batch['state_mask'],
                 'action_mask': data_batch['action_mask'],
+                # Diagnostic metadata only; it is never used as a model input.
+                'task_name': ep_meta['task_name'],
             }
 
             # Future-frame pixel_values (no color augmentation; keep the supervision target clean)
@@ -540,6 +665,7 @@ def create_dataset(config: Any, val: bool = False):
     lava_scales = list(config.training.get('lava_scales', [1, 2, 4, 8, 16]))
     lava_sample_ratio = float(config.training.get('lava_sample_ratio', 0.25))
     lava_scale_sampling = str(config.training.get('lava_scale_sampling', 'uniform'))
+    lava_sampling_balance = str(config.training.get('lava_sampling_balance', 'none'))
     lava_scale_probs = config.training.get('lava_scale_probs', None)
     if lava_scale_probs is not None:
         lava_scale_probs = list(lava_scale_probs)
@@ -561,6 +687,7 @@ def create_dataset(config: Any, val: bool = False):
         'lava_sample_ratio': lava_sample_ratio,
         'lava_scale_sampling': lava_scale_sampling,
         'lava_scale_probs': lava_scale_probs,
+        'lava_sampling_balance': lava_sampling_balance,
     }
 
     return RobotWinTaskDataset(**params)

@@ -94,6 +94,10 @@ model:
   lava:
     enabled: true
 
+    # 1-indexed Action Expert block used by the training-only LAVA branch.
+    # The policy still continues through all remaining blocks, final_norm, and its head.
+    action_target_layer: 6
+
     # World Residual
     dino_target_layer: -4
     residual_dim: 32
@@ -141,14 +145,18 @@ training:
   lambda_future_feat: 0.5
 
   # LAVA objective
-  lambda_lava: 0.1
+  lambda_lava: 0.01
   lava_temperature: 0.07
   lava_scales: [1, 2, 4, 8, 16]
   lava_sample_ratio: 0.25
   lava_scale_sampling: "uniform"  # "uniform" or "weighted"
+  # Keep frame-uniform sampling unless an experiment explicitly opts in.
+  # The provided Stage-1/Stage-2 Slurm scripts enable task_episode.
+  lava_sampling_balance: "none"   # "none", "task", or "task_episode"
   # lava_scale_probs: [0.25, 0.25, 0.20, 0.15, 0.15]  # used only for weighted
   lava_warmup_ratio: 0.05
-  lava_order_negative: true
+  lava_order_negative: true      # full-shuffle world-path negative for L >= 2
+  lava_grad_diagnostics_interval: 200
 
   # Velocity weighting (sample-level)
   use_vel_weight: false

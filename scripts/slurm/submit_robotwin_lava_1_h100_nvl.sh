@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # The Slurm job name is the unique RUN_NAME for both stages. Edit it once here.
-RUN_NAME="robotwin10_lava_1h100nvl"
+RUN_NAME="robotwin10_lava_layer6_balanced_1h100nvl"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGE1_SCRIPT="${SCRIPT_DIR}/stage1/train_robotwin_lava_stage1_1_h100_nvl.sbatch"
