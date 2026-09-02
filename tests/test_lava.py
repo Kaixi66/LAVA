@@ -96,6 +96,15 @@ def test_v5_weighted_count_balancing_uses_candidate_count_not_weight_sum():
     assert action_similarity_weight(
         torch.tensor(100.0), torch.tensor(1.0), 0.1) > 0.999
 
+    # CUDA autocast produces BF16 similarities while action-distance gates stay
+    # FP32. The weighted family reduction must safely promote the mixed dtypes.
+    mixed_values = values.to(torch.bfloat16)
+    mixed_result, mixed_counts = weighted_count_balanced_family_logit(
+        mixed_values, weights.float(), temperature)
+    assert mixed_result.dtype == torch.float32
+    assert torch.isfinite(mixed_result).all()
+    assert torch.equal(mixed_counts, counts)
+
 
 def test_v5_batch_uniform_scale_sampler_multiworker_and_resume():
     dataset = _ScaleEchoDataset()

@@ -1242,21 +1242,40 @@ class VLAModel(nn.Module):
                     positive_raw_paths.append(
                         raw_actions[batch_index, start:start + scale + 1])
 
-                cross_distances = torch.full_like(positive_world_logits, torch.nan)
-                local_distances = torch.full_like(positive_values, torch.nan)
-                far_distances = torch.full_like(positive_values, torch.nan)
+                # Action descriptors and their EMA calibrator are deliberately
+                # FP32. Under CUDA autocast the similarity logits are BF16, so
+                # inheriting their dtype here makes the FP32 gate assignment
+                # fail (and would unnecessarily quantize small distances).
+                cross_distances = torch.full(
+                    positive_world_logits.shape, torch.nan,
+                    device=device, dtype=torch.float32)
+                local_distances = torch.full(
+                    positive_values.shape, torch.nan,
+                    device=device, dtype=torch.float32)
+                far_distances = torch.full(
+                    positive_values.shape, torch.nan,
+                    device=device, dtype=torch.float32)
                 cross_components = {
-                    key: torch.full_like(positive_world_logits, torch.nan)
+                    key: torch.full(
+                        positive_world_logits.shape, torch.nan,
+                        device=device, dtype=torch.float32)
                     for key in ("arm", "gripper_state", "gripper_change")}
                 local_components = {
-                    key: torch.full_like(positive_values, torch.nan)
+                    key: torch.full(
+                        positive_values.shape, torch.nan,
+                        device=device, dtype=torch.float32)
                     for key in ("arm", "gripper_state", "gripper_change")}
                 far_components = {
-                    key: torch.full_like(positive_values, torch.nan)
+                    key: torch.full(
+                        positive_values.shape, torch.nan,
+                        device=device, dtype=torch.float32)
                     for key in ("arm", "gripper_state", "gripper_change")}
-                cross_weights = torch.ones_like(positive_world_logits)
-                local_weights = torch.ones_like(positive_values)
-                far_weights = torch.ones_like(positive_values)
+                cross_weights = torch.ones(
+                    positive_world_logits.shape, device=device, dtype=torch.float32)
+                local_weights = torch.ones(
+                    positive_values.shape, device=device, dtype=torch.float32)
+                far_weights = torch.ones(
+                    positive_values.shape, device=device, dtype=torch.float32)
                 component_values = {"arm": [], "gripper_state": [],
                                     "gripper_change": [], "combined": []}
 
