@@ -96,7 +96,7 @@ model:
 
     # 1-indexed Action Expert block used by the training-only LAVA branch.
     # The policy still continues through all remaining blocks, final_norm, and its head.
-    action_target_layer: 6
+    action_target_layer: "final"
 
     # World Residual
     dino_target_layer: -4
@@ -110,6 +110,13 @@ model:
 
     # Differentiable closed-form path LogSig order (1 or 2)
     logsig_depth: 2
+
+    # V4: population calibration preserves per-path order strength instead of
+    # forcing the first and second LogSig levels to unit norm independently.
+    signature_normalization:
+      type: "ema_calibrated"
+      ema_momentum: 0.99
+      level2_weight: 0.5
 
   # Action Expert configuration
   action_expert:
@@ -146,17 +153,35 @@ training:
 
   # LAVA objective
   lambda_lava: 0.01
+  # constant preserves the original V4 behavior.  The continuous D ablation
+  # uses step to lower lambda without resetting the optimizer or LR schedule.
+  lava_weight_schedule: "constant"  # constant / step / cosine
+  lava_min_weight: 0.0
+  lava_decay_start_ratio: 1.0
   lava_temperature: 0.07
   lava_scales: [1, 2, 4, 8, 16]
-  lava_sample_ratio: 0.25
-  lava_scale_sampling: "uniform"  # "uniform" or "weighted"
-  # Keep frame-uniform sampling unless an experiment explicitly opts in.
-  # The provided Stage-1/Stage-2 Slurm scripts enable task_episode.
-  lava_sampling_balance: "none"   # "none", "task", or "task_episode"
+  lava_sample_ratio: 0.125
+  lava_scale_sampling: "batch_uniform"  # one scale per batch; 5-batch shuffled cycle
+  lava_sampling_balance: "task_episode"  # LAVA anchors are task/episode balanced
+  # V4 combines cross-task batch paths, same-episode local/far paths, and
+  # count-balanced block-swap/full-derangement order negatives.
+  lava_negative_mode: "mixed"     # "batch", "episode_local", or "mixed"
+  lava_negative_window_multiplier: 4
+  lava_negative_window_max: 32     # R(L) = min(4L, 32)
   # lava_scale_probs: [0.25, 0.25, 0.20, 0.15, 0.15]  # used only for weighted
   lava_warmup_ratio: 0.05
-  lava_order_negative: true      # full-shuffle world-path negative for L >= 2
+  lava_order_negative: true      # block-swap + full-derangement for L >= 2
   lava_grad_diagnostics_interval: 200
+
+  # V5: gripper-aware, detached action similarity only softens false negatives.
+  # Order corruptions remain unweighted hard negatives.
+  lava_action_similarity_weighting: true
+  lava_action_similarity_min_weight: 0.1
+  lava_action_similarity_beta_momentum: 0.99
+  lava_action_similarity_beta_multiplier: 1.0
+  lava_action_gripper_indices: [6, 13]
+  lava_action_gripper_state_weight: 0.5
+  lava_action_gripper_change_weight: 0.5
 
   # Velocity weighting (sample-level)
   use_vel_weight: false

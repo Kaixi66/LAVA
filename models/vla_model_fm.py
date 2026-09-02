@@ -220,6 +220,31 @@ def sample_full_shuffle_permutation(length, device=None):
             return permutation.to(device=device)
 
 
+def sample_contiguous_block_swap_permutation(length, device=None):
+    """Swap two adjacent, non-empty contiguous blocks while preserving block order."""
+    if length < 2:
+        raise ValueError(f"Block swap requires length >= 2, got {length}")
+    if length == 2:
+        return torch.tensor([1, 0], device=device, dtype=torch.long)
+
+    # [0:a] [a:b] [b:c] [c:L] -> [0:a] [b:c] [a:b] [c:L]
+    cuts = torch.randperm(length + 1)[:3].sort().values.tolist()
+    while cuts[0] == cuts[1] or cuts[1] == cuts[2]:
+        cuts = torch.randperm(length + 1)[:3].sort().values.tolist()
+    a, b, c = cuts
+    if a == b or b == c:
+        raise RuntimeError("Failed to sample two non-empty blocks")
+    permutation = torch.cat((
+        torch.arange(0, a),
+        torch.arange(b, c),
+        torch.arange(a, b),
+        torch.arange(c, length),
+    ))
+    if torch.equal(permutation, torch.arange(length)):
+        raise RuntimeError("Contiguous block swap unexpectedly produced identity")
+    return permutation.to(device=device, dtype=torch.long)
+
+
 def _raw_logsignature_levels(path_increments):
     """Return the unnormalized depth-1 and antisymmetric depth-2 levels."""
     increments = path_increments.float()
@@ -263,6 +288,188 @@ def normalized_logsignature(path_increments, depth=2, eps=1e-6,
         "level2_raw_norm": raw_level_two.detach().norm(),
     }
     return signature, raw_norms
+
+
+class EMALogSignatureCalibrator(nn.Module):
+    """Population-scale calibration for variable-length depth-1/2 LogSigs.
+
+    Unlike per-sample level normalization, this preserves whether an individual
+    path has weak or strong second-order structure. Statistics are modality- and
+    scale-specific buffers, so they are checkpointed and inherited by Stage 2.
+    """
+
+    _MODALITIES = {"action": 0, "world": 1}
+
+    def __init__(self, scales=(1, 2, 4, 8, 16), momentum=0.99,
+                 level2_weight=0.5, eps=1e-6):
+        super().__init__()
+        scales = tuple(int(scale) for scale in scales)
+        if not scales or len(set(scales)) != len(scales):
+            raise ValueError(f"Calibration scales must be unique and non-empty: {scales}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"EMA momentum must be in [0,1), got {momentum}")
+        if level2_weight < 0:
+            raise ValueError(f"Level-2 weight must be non-negative, got {level2_weight}")
+        self.scales = scales
+        self.scale_to_index = {scale: index for index, scale in enumerate(scales)}
+        self.momentum = float(momentum)
+        self.level2_weight = float(level2_weight)
+        self.eps = float(eps)
+        # [modality(action/world), level(1/2), scale]
+        self.register_buffer(
+            "ema_squared_norm", torch.ones(2, 2, len(scales), dtype=torch.float32))
+        self.register_buffer(
+            "ema_initialized", torch.zeros(2, 2, len(scales), dtype=torch.bool))
+
+    def _indices(self, modality, scale):
+        if modality not in self._MODALITIES:
+            raise ValueError(f"Unknown LogSig modality: {modality}")
+        scale = int(scale)
+        if scale not in self.scale_to_index:
+            raise ValueError(
+                f"Scale {scale} is absent from calibrator scales {self.scales}")
+        return self._MODALITIES[modality], self.scale_to_index[scale]
+
+    @torch.no_grad()
+    def update(self, modality, level_ones, level_twos, scales):
+        """Update detached FP32 block-energy statistics from positive paths."""
+        if not (len(level_ones) == len(level_twos) == len(scales)):
+            raise ValueError("LogSig calibration inputs must have matching lengths")
+        modality_index = self._MODALITIES[modality]
+        for scale in sorted(set(int(value) for value in scales)):
+            scale_index = self.scale_to_index[scale]
+            selected = [index for index, value in enumerate(scales)
+                        if int(value) == scale]
+            level_values = (
+                torch.stack([level_ones[index].detach().float() for index in selected]),
+                torch.stack([level_twos[index].detach().float() for index in selected]),
+            )
+            for level_index, values in enumerate(level_values):
+                if level_index == 1 and scale < 2:
+                    continue
+                batch_squared_norm = values.square().sum(dim=-1).mean()
+                target = self.ema_squared_norm[modality_index, level_index, scale_index]
+                initialized = self.ema_initialized[
+                    modality_index, level_index, scale_index]
+                ema_value = (
+                    target * self.momentum
+                    + batch_squared_norm * (1.0 - self.momentum))
+                target.copy_(torch.where(
+                    initialized, ema_value,
+                    batch_squared_norm.clamp_min(self.eps ** 2)))
+                initialized.fill_(True)
+
+    def forward(self, level_one, level_two, modality, scale, depth=2):
+        modality_index, scale_index = self._indices(modality, scale)
+        level_one_rms = self.ema_squared_norm[
+            modality_index, 0, scale_index].detach().sqrt().clamp_min(self.eps)
+        calibrated_one = level_one.float() / level_one_rms
+        if depth == 1:
+            return F.normalize(calibrated_one, dim=0, eps=self.eps), {
+                "level1_calibrated_norm": calibrated_one.detach().norm(),
+                "level2_calibrated_norm": calibrated_one.new_tensor(0.0),
+                "level2_energy_fraction": calibrated_one.new_tensor(0.0),
+                "level1_ema_rms": level_one_rms.detach(),
+                "level2_ema_rms": calibrated_one.new_tensor(float("nan")),
+            }
+
+        level_two_rms = self.ema_squared_norm[
+            modality_index, 1, scale_index].detach().sqrt().clamp_min(self.eps)
+        calibrated_two = (
+            level_two.float() / level_two_rms * self.level2_weight)
+        joined = torch.cat((calibrated_one, calibrated_two), dim=0)
+        energy_one = calibrated_one.square().sum()
+        energy_two = calibrated_two.square().sum()
+        energy_fraction = energy_two / (energy_one + energy_two).clamp_min(self.eps ** 2)
+        return F.normalize(joined, dim=0, eps=self.eps), {
+            "level1_calibrated_norm": calibrated_one.detach().norm(),
+            "level2_calibrated_norm": calibrated_two.detach().norm(),
+            "level2_energy_fraction": energy_fraction.detach(),
+            "level1_ema_rms": level_one_rms.detach(),
+            "level2_ema_rms": level_two_rms.detach(),
+        }
+
+
+class EMAActionDistanceCalibrator(nn.Module):
+    """Family-balanced, per-scale action-distance calibration for V5."""
+
+    def __init__(self, scales=(1, 2, 4, 8, 16), momentum=0.99,
+                 multiplier=1.0, eps=1e-8):
+        super().__init__()
+        self.scales = tuple(int(scale) for scale in scales)
+        self.scale_to_index = {scale: index for index, scale in enumerate(self.scales)}
+        self.momentum = float(momentum)
+        self.multiplier = float(multiplier)
+        self.eps = float(eps)
+        if not 0.0 <= self.momentum < 1.0:
+            raise ValueError("Action-distance EMA momentum must be in [0,1)")
+        if self.multiplier <= 0.0:
+            raise ValueError("Action-distance beta multiplier must be positive")
+        self.register_buffer("ema_beta", torch.ones(len(self.scales), dtype=torch.float32))
+        self.register_buffer("ema_initialized", torch.zeros(len(self.scales), dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, scale, family_distances):
+        """Equal-weight available family medians, independent of family counts."""
+        index = self.scale_to_index[int(scale)]
+        medians = []
+        for distances in family_distances:
+            if distances is not None and distances.numel():
+                medians.append(distances.detach().float().median())
+        if not medians:
+            return None
+        aggregate = torch.stack(medians).mean().clamp_min(self.eps)
+        if self.ema_initialized[index]:
+            aggregate = (self.ema_beta[index] * self.momentum
+                         + aggregate * (1.0 - self.momentum))
+        self.ema_beta[index].copy_(aggregate)
+        self.ema_initialized[index].fill_(True)
+        return aggregate
+
+    def beta(self, scale):
+        index = self.scale_to_index[int(scale)]
+        return (self.ema_beta[index].detach() * self.multiplier).clamp_min(self.eps)
+
+
+def action_path_distance(left_normalized, left_raw, right_normalized, right_raw,
+                         gripper_indices=(6, 13), gripper_state_weight=0.5,
+                         gripper_change_weight=0.5):
+    """Detached RoboTwin action descriptor distance for two equal-length paths."""
+    if left_normalized.shape != right_normalized.shape or left_raw.shape != right_raw.shape:
+        raise ValueError("Action descriptor paths must have matching shapes")
+    gripper_indices = tuple(int(index) for index in gripper_indices)
+    action_dim = left_normalized.shape[-1]
+    if any(index < 0 or index >= action_dim for index in gripper_indices):
+        raise ValueError(f"Invalid gripper indices {gripper_indices} for action_dim={action_dim}")
+    arm_indices = [index for index in range(action_dim) if index not in gripper_indices]
+    left_arm_delta = torch.diff(left_normalized[..., arm_indices].detach().float(), dim=0)
+    right_arm_delta = torch.diff(right_normalized[..., arm_indices].detach().float(), dim=0)
+    left_grip = left_raw[..., list(gripper_indices)].detach().float()
+    right_grip = right_raw[..., list(gripper_indices)].detach().float()
+    arm = F.mse_loss(left_arm_delta, right_arm_delta)
+    grip_state = F.mse_loss(left_grip, right_grip)
+    grip_change = F.mse_loss(torch.diff(left_grip, dim=0), torch.diff(right_grip, dim=0))
+    combined = (arm + float(gripper_state_weight) * grip_state
+                + float(gripper_change_weight) * grip_change)
+    return arm, grip_state, grip_change, combined
+
+
+def action_similarity_weight(distance, beta, min_weight=0.1):
+    """V5 false-negative gate; a true negative asymptotically keeps weight 1."""
+    return (float(min_weight) + (1.0 - float(min_weight))
+            * (1.0 - torch.exp(-distance / beta.clamp_min(1e-8))))
+
+
+def weighted_count_balanced_family_logit(values, weights, temperature):
+    """Weighted log-sum-exp with count (not weight-sum) family balancing."""
+    valid = torch.isfinite(values)
+    counts = valid.sum(dim=1)
+    scaled = (values / temperature
+              + weights.clamp_min(1e-12).log()).masked_fill(~valid, -torch.inf)
+    result = temperature * (
+        torch.logsumexp(scaled, dim=1)
+        - counts.clamp_min(1).float().log())
+    return result.masked_fill(counts == 0, -torch.inf), counts
 
 
 def future_feature_cosine_loss(pred, target):
@@ -373,6 +580,16 @@ class VLAModel(nn.Module):
                  lava_qformer_num_heads=4,
                  lava_logsig_depth=2,
                  lava_action_target_layer="final",
+                 lava_scales=(1, 2, 4, 8, 16),
+                 lava_signature_ema_momentum=0.99,
+                 lava_signature_level2_weight=0.5,
+                 lava_action_similarity_weighting=False,
+                 lava_action_similarity_min_weight=0.1,
+                 lava_action_similarity_beta_momentum=0.99,
+                 lava_action_similarity_beta_multiplier=1.0,
+                 lava_action_gripper_indices=(6, 13),
+                 lava_action_gripper_state_weight=0.5,
+                 lava_action_gripper_change_weight=0.5,
                  ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -390,6 +607,18 @@ class VLAModel(nn.Module):
         self.use_lava = use_lava
         self.lava_residual_dim = lava_residual_dim
         self.lava_logsig_depth = lava_logsig_depth
+        self.lava_action_similarity_weighting = bool(
+            lava_action_similarity_weighting)
+        self.lava_action_similarity_min_weight = float(
+            lava_action_similarity_min_weight)
+        self.lava_action_gripper_indices = tuple(
+            int(index) for index in lava_action_gripper_indices)
+        self.lava_action_gripper_state_weight = float(
+            lava_action_gripper_state_weight)
+        self.lava_action_gripper_change_weight = float(
+            lava_action_gripper_change_weight)
+        if not 0.0 <= self.lava_action_similarity_min_weight <= 1.0:
+            raise ValueError("lava_action_similarity_min_weight must be in [0,1]")
         if isinstance(lava_action_target_layer, str):
             normalized_target = lava_action_target_layer.strip().lower()
             if normalized_target == "final":
@@ -520,6 +749,19 @@ class VLAModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(128, lava_residual_dim),
             )
+            self.lava_signature_calibrator = EMALogSignatureCalibrator(
+                scales=lava_scales,
+                momentum=lava_signature_ema_momentum,
+                level2_weight=lava_signature_level2_weight,
+            )
+            # Conditional registration is deliberate: V4 state dicts do not
+            # acquire V5-only keys and therefore still strict-load when disabled.
+            if self.lava_action_similarity_weighting:
+                self.lava_action_distance_calibrator = EMAActionDistanceCalibrator(
+                    scales=lava_scales,
+                    momentum=lava_action_similarity_beta_momentum,
+                    multiplier=lava_action_similarity_beta_multiplier,
+                )
 
     def forward(self,
                 t,
@@ -627,7 +869,15 @@ class VLAModel(nn.Module):
                           batch_indices, interval_starts, interval_scales,
                           temperature=0.07, order_negative=True,
                           flow_timesteps=None, task_names=None,
-                          action_execution_horizon=16):
+                          action_execution_horizon=16,
+                          temporal_negative_feature_differences=None,
+                          far_negative_feature_differences=None,
+                          negative_mode="batch",
+                          normalized_actions=None, raw_actions=None,
+                          temporal_negative_normalized_actions=None,
+                          temporal_negative_raw_actions=None,
+                          far_negative_normalized_actions=None,
+                          far_negative_raw_actions=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -645,11 +895,55 @@ class VLAModel(nn.Module):
                 "same_task_negative_sim": float("nan"),
                 "cross_task_negative_sim": float("nan"),
                 "task_shortcut_gap": float("nan"),
+                "temporal_negative_sim": float("nan"),
+                "temporal_margin": float("nan"),
+                "temporal_acc": float("nan"),
+                "order_acc": float("nan"),
+                "candidate_acc": float("nan"),
+                "positive_temporal_world_sim": float("nan"),
                 "lava_sample_count": 0,
                 "lava_order_negative_count": 0,
             }
         if temperature <= 0:
             raise ValueError(f"LAVA temperature must be positive, got {temperature}")
+        if self.lava_action_similarity_weighting:
+            if normalized_actions is None or raw_actions is None:
+                raise ValueError("V5 action weighting requires normalized and raw actions")
+            if negative_mode != "mixed":
+                raise ValueError("V5 action weighting expects V4 mixed negatives")
+            required_paths = (
+                temporal_negative_normalized_actions,
+                temporal_negative_raw_actions,
+                far_negative_normalized_actions,
+                far_negative_raw_actions,
+            )
+            if any(value is None or len(value) != sample_count for value in required_paths):
+                raise ValueError("V5 requires one local and far action path per anchor")
+        if negative_mode not in {"batch", "episode_local", "mixed"}:
+            raise ValueError(
+                "negative_mode must be 'batch', 'episode_local', or 'mixed', "
+                f"got {negative_mode}")
+        if negative_mode in {"episode_local", "mixed"}:
+            if temporal_negative_feature_differences is None:
+                raise ValueError(
+                    f"{negative_mode} mode requires local-negative feature differences")
+            if len(temporal_negative_feature_differences) != sample_count:
+                raise ValueError(
+                    "Every positive LAVA path requires one temporal-negative path")
+            if negative_mode == "mixed":
+                if far_negative_feature_differences is None:
+                    raise ValueError(
+                        "mixed mode requires far-negative feature differences")
+                if len(far_negative_feature_differences) != sample_count:
+                    raise ValueError(
+                        "Every positive LAVA path requires one far-negative path")
+            elif far_negative_feature_differences is not None:
+                raise ValueError(
+                    "episode_local mode must not receive far-negative differences")
+        elif (temporal_negative_feature_differences is not None
+              or far_negative_feature_differences is not None):
+            raise ValueError(
+                "batch mode must not receive paired negative feature differences")
 
         batch_indices = batch_indices.to(action_hidden.device, dtype=torch.long)
         interval_starts = interval_starts.to(action_hidden.device, dtype=torch.long)
@@ -662,8 +956,39 @@ class VLAModel(nn.Module):
             differences.to(action_hidden.device, dtype=action_hidden.dtype)
             for differences in world_feature_differences
         ], dim=0)
-        flat_world_residuals = self.lava_world_encoder(flat_world)
+        all_world_inputs = flat_world
+        flat_temporal_negative_world = None
+        flat_far_negative_world = None
+        if negative_mode in {"episode_local", "mixed"}:
+            flat_temporal_negative_world = torch.cat([
+                differences.to(action_hidden.device, dtype=action_hidden.dtype)
+                for differences in temporal_negative_feature_differences
+            ], dim=0)
+            all_world_inputs = torch.cat(
+                (flat_world, flat_temporal_negative_world), dim=0)
+            if negative_mode == "mixed":
+                flat_far_negative_world = torch.cat([
+                    differences.to(action_hidden.device, dtype=action_hidden.dtype)
+                    for differences in far_negative_feature_differences
+                ], dim=0)
+                all_world_inputs = torch.cat(
+                    (all_world_inputs, flat_far_negative_world), dim=0)
+        all_world_residuals = self.lava_world_encoder(all_world_inputs)
+        flat_world_residuals = all_world_residuals[:flat_world.shape[0]]
         world_residual_paths = list(flat_world_residuals.split(lengths, dim=0))
+        temporal_negative_residual_paths = None
+        far_negative_residual_paths = None
+        if negative_mode in {"episode_local", "mixed"}:
+            positive_end = flat_world.shape[0]
+            temporal_end = positive_end + flat_temporal_negative_world.shape[0]
+            flat_temporal_negative_residuals = all_world_residuals[
+                positive_end:temporal_end]
+            temporal_negative_residual_paths = list(
+                flat_temporal_negative_residuals.split(lengths, dim=0))
+            if negative_mode == "mixed":
+                flat_far_negative_residuals = all_world_residuals[temporal_end:]
+                far_negative_residual_paths = list(
+                    flat_far_negative_residuals.split(lengths, dim=0))
 
         action_residual_paths = []
         for sample_idx, start, scale in zip(
@@ -679,103 +1004,556 @@ class VLAModel(nn.Module):
 
         flat_action_residuals = torch.cat(action_residual_paths, dim=0)
 
-        action_signatures = []
-        world_signatures = []
+        action_raw_levels = []
+        world_raw_levels = []
         action_level1_raw_norms = []
         action_level2_raw_norms = []
         world_level1_raw_norms = []
         world_level2_raw_norms = []
-        shuffled_signatures = []
-        shuffled_action_indices = []
-        for sample_idx, (action_path, world_path, scale) in enumerate(zip(
-                action_residual_paths, world_residual_paths, lengths)):
+        time_channels = []
+        for action_path, world_path, scale in zip(
+                action_residual_paths, world_residual_paths, lengths):
             time_channel = torch.full(
                 (scale, 1), 1.0 / scale, device=action_path.device, dtype=action_path.dtype)
+            time_channels.append(time_channel)
             action_increments = torch.cat((action_path, time_channel), dim=-1)
             world_increments = torch.cat((world_path, time_channel), dim=-1)
-            action_signature, action_raw_norms = normalized_logsignature(
-                action_increments, self.lava_logsig_depth, return_raw_norms=True)
-            world_signature, world_raw_norms = normalized_logsignature(
-                world_increments, self.lava_logsig_depth, return_raw_norms=True)
+            action_levels = _raw_logsignature_levels(action_increments)
+            world_levels = _raw_logsignature_levels(world_increments)
+            action_raw_levels.append(action_levels)
+            world_raw_levels.append(world_levels)
+            action_level1_raw_norms.append(action_levels[0].detach().norm())
+            action_level2_raw_norms.append(action_levels[1].detach().norm())
+            world_level1_raw_norms.append(world_levels[0].detach().norm())
+            world_level2_raw_norms.append(world_levels[1].detach().norm())
+
+        # Update only from positive paths. Paired negatives then use exactly the
+        # same detached population calibration in this forward pass.
+        if self.training:
+            self.lava_signature_calibrator.update(
+                "action", [value[0] for value in action_raw_levels],
+                [value[1] for value in action_raw_levels], lengths)
+            self.lava_signature_calibrator.update(
+                "world", [value[0] for value in world_raw_levels],
+                [value[1] for value in world_raw_levels], lengths)
+
+        action_signatures = []
+        world_signatures = []
+        action_calibration = []
+        world_calibration = []
+        for action_levels, world_levels, scale in zip(
+                action_raw_levels, world_raw_levels, lengths):
+            action_signature, action_stats = self.lava_signature_calibrator(
+                *action_levels, "action", scale, depth=self.lava_logsig_depth)
+            world_signature, world_stats = self.lava_signature_calibrator(
+                *world_levels, "world", scale, depth=self.lava_logsig_depth)
             action_signatures.append(action_signature)
             world_signatures.append(world_signature)
-            action_level1_raw_norms.append(action_raw_norms["level1_raw_norm"])
-            action_level2_raw_norms.append(action_raw_norms["level2_raw_norm"])
-            world_level1_raw_norms.append(world_raw_norms["level1_raw_norm"])
-            world_level2_raw_norms.append(world_raw_norms["level2_raw_norm"])
+            action_calibration.append(action_stats)
+            world_calibration.append(world_stats)
 
+        def calibrated_world_signature(path, time_channel, scale):
+            levels = _raw_logsignature_levels(
+                torch.cat((path, time_channel), dim=-1))
+            return self.lava_signature_calibrator(
+                *levels, "world", scale, depth=self.lava_logsig_depth)[0]
+
+        temporal_negative_signatures = []
+        far_negative_signatures = []
+        block_swap_signatures = []
+        derangement_signatures = []
+        block_action_indices = []
+        derangement_action_indices = []
+        for sample_idx, (world_path, time_channel, scale) in enumerate(zip(
+                world_residual_paths, time_channels, lengths)):
+            if temporal_negative_residual_paths is not None:
+                temporal_negative_signatures.append(calibrated_world_signature(
+                    temporal_negative_residual_paths[sample_idx], time_channel, scale))
+            if far_negative_residual_paths is not None:
+                far_negative_signatures.append(calibrated_world_signature(
+                    far_negative_residual_paths[sample_idx], time_channel, scale))
             if order_negative and scale >= 2:
-                permutation = sample_full_shuffle_permutation(
+                block_permutation = sample_contiguous_block_swap_permutation(
                     scale, device=world_path.device)
-                shuffled_world = world_path[permutation]
-                shuffled_increments = torch.cat((shuffled_world, time_channel), dim=-1)
-                shuffled_signatures.append(
-                    normalized_logsignature(shuffled_increments, self.lava_logsig_depth))
-                shuffled_action_indices.append(sample_idx)
+                derangement_permutation = sample_full_shuffle_permutation(
+                    scale, device=world_path.device)
+                block_swap_signatures.append(calibrated_world_signature(
+                    world_path[block_permutation], time_channel, scale))
+                block_action_indices.append(sample_idx)
+                # L=2 has only one non-identity permutation; do not duplicate it.
+                if scale >= 3:
+                    derangement_signatures.append(calibrated_world_signature(
+                        world_path[derangement_permutation], time_channel, scale))
+                    derangement_action_indices.append(sample_idx)
 
-        action_signatures = F.normalize(torch.stack(action_signatures), dim=-1)
-        world_signatures = F.normalize(torch.stack(world_signatures), dim=-1)
+        action_signatures = torch.stack(action_signatures)
+        world_signatures = torch.stack(world_signatures)
+        device = action_signatures.device
+        positive_values = (action_signatures * world_signatures).sum(dim=-1)
+        nan_value = action_signatures.new_tensor(float("nan"))
+        same_task_negative_sim = nan_value.clone()
+        cross_task_negative_sim = nan_value.clone()
+        task_shortcut_gap = nan_value.clone()
+        temporal_negative_sim = nan_value.clone()
+        temporal_margin = nan_value.clone()
+        temporal_accuracy = nan_value.clone()
+        candidate_accuracy = nan_value.clone()
+        positive_temporal_world_sim = nan_value.clone()
+        order_accuracy = nan_value.clone()
+        temporal_margin_per_sample = torch.full(
+            (sample_count,), torch.nan, device=device, dtype=torch.float32)
+        temporal_values = torch.full(
+            (sample_count,), torch.nan, device=device,
+            dtype=positive_values.dtype)
+        candidate_correct_per_sample = torch.full(
+            (sample_count,), torch.nan, device=device, dtype=torch.float32)
+
         positive_world_logits = action_signatures @ world_signatures.transpose(0, 1)
-        logits = positive_world_logits
-        labels = torch.arange(sample_count, device=logits.device)
-
-        positive_values = positive_world_logits.diagonal()
-        same_task_negative_sim = logits.new_tensor(float("nan"))
-        cross_task_negative_sim = logits.new_tensor(float("nan"))
-        task_shortcut_gap = logits.new_tensor(float("nan"))
         if sample_count > 1:
-            off_diagonal = ~torch.eye(sample_count, dtype=torch.bool, device=logits.device)
-            negative_sim = positive_world_logits[off_diagonal].mean()
-            action_pair_sim = (action_signatures @ action_signatures.transpose(0, 1))[off_diagonal].mean()
-            world_pair_sim = (world_signatures @ world_signatures.transpose(0, 1))[off_diagonal].mean()
-            if task_names is not None:
-                if len(task_names) != action_hidden.shape[0]:
-                    raise ValueError(
-                        "task_names must have one entry per action-hidden batch sample")
-                selected_task_names = [task_names[index] for index in batch_indices.tolist()]
-                same_task = torch.tensor([
-                    [left == right for right in selected_task_names]
-                    for left in selected_task_names
-                ], device=logits.device, dtype=torch.bool)
-                same_task &= off_diagonal
-                cross_task = (~same_task) & off_diagonal
-                if same_task.any():
-                    same_task_negative_sim = positive_world_logits[same_task].mean()
-                if cross_task.any():
-                    cross_task_negative_sim = positive_world_logits[cross_task].mean()
-                if torch.isfinite(same_task_negative_sim) and torch.isfinite(cross_task_negative_sim):
-                    task_shortcut_gap = same_task_negative_sim - cross_task_negative_sim
+            off_diagonal = ~torch.eye(
+                sample_count, dtype=torch.bool, device=device)
+            action_pair_sim = (
+                action_signatures @ action_signatures.transpose(0, 1)
+            )[off_diagonal].mean()
+            world_pair_sim = (
+                world_signatures @ world_signatures.transpose(0, 1)
+            )[off_diagonal].mean()
         else:
-            negative_sim = logits.new_tensor(0.0)
-            action_pair_sim = logits.new_tensor(0.0)
-            world_pair_sim = logits.new_tensor(0.0)
+            off_diagonal = torch.zeros(
+                (sample_count, sample_count), dtype=torch.bool, device=device)
+            action_pair_sim = action_signatures.new_tensor(0.0)
+            world_pair_sim = action_signatures.new_tensor(0.0)
 
-        shuffle_sim = logits.new_tensor(0.0)
-        order_margin = logits.new_tensor(0.0)
+        def paired_signature_values(signatures, indices):
+            values = torch.full_like(positive_values, -torch.inf)
+            if signatures:
+                index_tensor = torch.as_tensor(
+                    indices, device=device, dtype=torch.long)
+                stacked = torch.stack(signatures)
+                values[index_tensor] = (
+                    action_signatures[index_tensor] * stacked).sum(dim=-1)
+            return values
+
+        def family_logmeanexp(values):
+            """Return one count-balanced similarity logit for a negative family."""
+            valid = torch.isfinite(values)
+            counts = valid.sum(dim=1)
+            scaled = (values / temperature).masked_fill(~valid, -torch.inf)
+            family = temperature * (
+                torch.logsumexp(scaled, dim=1)
+                - counts.clamp_min(1).float().log())
+            return family.masked_fill(counts == 0, -torch.inf), counts
+
+        block_values = paired_signature_values(
+            block_swap_signatures, block_action_indices)
+        derangement_values = paired_signature_values(
+            derangement_signatures, derangement_action_indices)
+        order_candidates = torch.stack((block_values, derangement_values), dim=1)
+        order_family_values, order_candidate_counts = family_logmeanexp(
+            order_candidates)
+
+        shuffle_sim = action_signatures.new_tensor(0.0)
+        order_margin = action_signatures.new_tensor(0.0)
         order_margin_per_sample = torch.full(
-            (sample_count,), torch.nan, device=logits.device, dtype=torch.float32)
-        if shuffled_signatures:
-            shuffled_signatures = F.normalize(torch.stack(shuffled_signatures), dim=-1)
-            shuffle_logits = action_signatures @ shuffled_signatures.transpose(0, 1)
-            logits = torch.cat((logits, shuffle_logits), dim=1)
-            paired_shuffle = shuffle_logits[
-                torch.as_tensor(shuffled_action_indices, device=logits.device),
-                torch.arange(len(shuffled_action_indices), device=logits.device),
-            ]
-            paired_positive = (action_signatures * world_signatures).sum(dim=-1)[
-                torch.as_tensor(shuffled_action_indices, device=logits.device)]
-            shuffle_sim = paired_shuffle.mean()
-            paired_order_margin = paired_positive - paired_shuffle
-            order_margin = paired_order_margin.mean()
-            order_margin_per_sample[
-                torch.as_tensor(shuffled_action_indices, device=logits.device)
-            ] = paired_order_margin.float()
+            (sample_count,), torch.nan, device=device, dtype=torch.float32)
+        order_valid = torch.isfinite(order_family_values)
+        if order_valid.any():
+            individual_order_values = order_candidates[torch.isfinite(order_candidates)]
+            shuffle_sim = individual_order_values.mean()
+            order_margin_per_sample[order_valid] = (
+                positive_values[order_valid] - order_family_values[order_valid]).float()
+            order_margin = order_margin_per_sample[order_valid].mean()
+            order_accuracy = (
+                positive_values[order_valid] > order_family_values[order_valid]
+            ).float().mean()
 
-        loss_lava_per_sample = F.cross_entropy(
-            logits / temperature, labels, reduction="none")
+        selected_task_names = None
+        same_task = torch.zeros_like(off_diagonal)
+        cross_task = torch.zeros_like(off_diagonal)
+        same_scale = interval_scales[:, None] == interval_scales[None, :]
+        if task_names is not None and sample_count > 1:
+            if len(task_names) != action_hidden.shape[0]:
+                raise ValueError(
+                    "task_names must have one entry per action-hidden batch sample")
+            selected_task_names = [
+                task_names[index] for index in batch_indices.tolist()]
+            same_task = torch.tensor([
+                [left == right for right in selected_task_names]
+                for left in selected_task_names
+            ], device=device, dtype=torch.bool) & off_diagonal
+            cross_task = (~torch.tensor([
+                [left == right for right in selected_task_names]
+                for left in selected_task_names
+            ], device=device, dtype=torch.bool)) & off_diagonal
+            if same_task.any():
+                same_task_negative_sim = positive_world_logits[same_task].mean()
+            if cross_task.any():
+                cross_task_negative_sim = positive_world_logits[cross_task].mean()
+            if (torch.isfinite(same_task_negative_sim)
+                    and torch.isfinite(cross_task_negative_sim)):
+                task_shortcut_gap = same_task_negative_sim - cross_task_negative_sim
+
+        cross_same_scale_mask = cross_task & same_scale
+        cross_task_family_values, cross_task_candidate_counts = family_logmeanexp(
+            positive_world_logits.masked_fill(~cross_same_scale_mask, -torch.inf))
+        raw_cross_task_family_values = cross_task_family_values
+        cross_task_valid = torch.isfinite(cross_task_family_values)
+        cross_task_margin_per_sample = torch.full(
+            (sample_count,), torch.nan, device=device, dtype=torch.float32)
+        cross_task_margin_per_sample[cross_task_valid] = (
+            positive_values[cross_task_valid]
+            - cross_task_family_values[cross_task_valid]).float()
+
+        far_values = torch.full_like(positive_values, -torch.inf)
+        far_margin_per_sample = torch.full(
+            (sample_count,), torch.nan, device=device, dtype=torch.float32)
+        positive_far_world_sim = nan_value.clone()
+
+        if negative_mode in {"episode_local", "mixed"}:
+            temporal_negative_signatures = torch.stack(temporal_negative_signatures)
+            temporal_values = (
+                action_signatures * temporal_negative_signatures).sum(dim=-1)
+            temporal_negative_sim = temporal_values.mean()
+            temporal_margin_per_sample = (positive_values - temporal_values).float()
+            temporal_margin = temporal_margin_per_sample.mean()
+            temporal_accuracy = (positive_values > temporal_values).float().mean()
+            positive_temporal_world_sim = (
+                world_signatures * temporal_negative_signatures).sum(dim=-1).mean()
+            if negative_mode == "mixed":
+                far_negative_signatures = torch.stack(far_negative_signatures)
+                far_values = (
+                    action_signatures * far_negative_signatures).sum(dim=-1)
+                far_margin_per_sample = (positive_values - far_values).float()
+                positive_far_world_sim = (
+                    world_signatures * far_negative_signatures).sum(dim=-1).mean()
+
+            weighted_temporal_values = temporal_values
+            weighted_far_values = far_values
+            raw_logits = None
+            action_similarity_stats = {}
+            action_similarity_audit = []
+            if self.lava_action_similarity_weighting:
+                positive_norm_paths = []
+                positive_raw_paths = []
+                for batch_index, start, scale in zip(
+                        batch_indices.tolist(), interval_starts.tolist(), lengths):
+                    positive_norm_paths.append(
+                        normalized_actions[batch_index, start:start + scale + 1])
+                    positive_raw_paths.append(
+                        raw_actions[batch_index, start:start + scale + 1])
+
+                cross_distances = torch.full_like(positive_world_logits, torch.nan)
+                local_distances = torch.full_like(positive_values, torch.nan)
+                far_distances = torch.full_like(positive_values, torch.nan)
+                cross_components = {
+                    key: torch.full_like(positive_world_logits, torch.nan)
+                    for key in ("arm", "gripper_state", "gripper_change")}
+                local_components = {
+                    key: torch.full_like(positive_values, torch.nan)
+                    for key in ("arm", "gripper_state", "gripper_change")}
+                far_components = {
+                    key: torch.full_like(positive_values, torch.nan)
+                    for key in ("arm", "gripper_state", "gripper_change")}
+                cross_weights = torch.ones_like(positive_world_logits)
+                local_weights = torch.ones_like(positive_values)
+                far_weights = torch.ones_like(positive_values)
+                component_values = {"arm": [], "gripper_state": [],
+                                    "gripper_change": [], "combined": []}
+
+                def measure(left_index, right_normalized, right_raw):
+                    values = action_path_distance(
+                        positive_norm_paths[left_index], positive_raw_paths[left_index],
+                        right_normalized, right_raw,
+                        gripper_indices=self.lava_action_gripper_indices,
+                        gripper_state_weight=self.lava_action_gripper_state_weight,
+                        gripper_change_weight=self.lava_action_gripper_change_weight)
+                    for key, value in zip(component_values, values):
+                        component_values[key].append(value.detach().float())
+                    return tuple(value.to(device=device) for value in values)
+
+                for left in range(sample_count):
+                    for right in range(sample_count):
+                        if cross_same_scale_mask[left, right]:
+                            measured = measure(
+                                left, positive_norm_paths[right], positive_raw_paths[right])
+                            cross_distances[left, right] = measured[-1]
+                            for key, value in zip(cross_components, measured[:-1]):
+                                cross_components[key][left, right] = value
+                    measured = measure(
+                        left, temporal_negative_normalized_actions[left],
+                        temporal_negative_raw_actions[left])
+                    local_distances[left] = measured[-1]
+                    for key, value in zip(local_components, measured[:-1]):
+                        local_components[key][left] = value
+                    measured = measure(
+                        left, far_negative_normalized_actions[left],
+                        far_negative_raw_actions[left])
+                    far_distances[left] = measured[-1]
+                    for key, value in zip(far_components, measured[:-1]):
+                        far_components[key][left] = value
+
+                per_scale_medians = {}
+                for scale in sorted(set(lengths)):
+                    scale_mask = interval_scales == scale
+                    cross_values = cross_distances[
+                        scale_mask[:, None] & cross_same_scale_mask]
+                    cross_values = cross_values[torch.isfinite(cross_values)]
+                    local_values = local_distances[scale_mask]
+                    far_distance_values = far_distances[scale_mask]
+                    families = (cross_values, local_values, far_distance_values)
+                    medians = [values.median() if values.numel() else None
+                               for values in families]
+                    per_scale_medians[scale] = medians
+                    aggregate = (self.lava_action_distance_calibrator.update(
+                        scale, families) if self.training else None)
+                    available = [value for value in medians if value is not None]
+                    if aggregate is None:
+                        aggregate = (torch.stack(available).mean()
+                                     if available else nan_value)
+                    beta = self.lava_action_distance_calibrator.beta(scale)
+
+                    def gate(distance):
+                        return action_similarity_weight(
+                            distance, beta,
+                            self.lava_action_similarity_min_weight)
+
+                    cross_mask = scale_mask[:, None] & cross_same_scale_mask
+                    cross_weights[cross_mask] = gate(cross_distances[cross_mask])
+                    local_weights[scale_mask] = gate(local_distances[scale_mask])
+                    far_weights[scale_mask] = gate(far_distances[scale_mask])
+                    for family_name, median in zip(("cross", "local", "far"), medians):
+                        action_similarity_stats[
+                            f"action_distance_{family_name}_median_s{scale}"] = (
+                                median.item() if median is not None else float("nan"))
+                    action_similarity_stats[f"action_distance_aggregate_s{scale}"] = (
+                        aggregate.item())
+                    action_similarity_stats[f"action_distance_beta_s{scale}"] = beta.item()
+
+                cross_task_family_values, _ = weighted_count_balanced_family_logit(
+                    positive_world_logits.masked_fill(
+                        ~cross_same_scale_mask, -torch.inf), cross_weights,
+                    temperature)
+                weighted_temporal_values = temporal_values + temperature * local_weights.log()
+                weighted_far_values = far_values + temperature * far_weights.log()
+
+                def finite_weight_stats(name, weights, mask=None):
+                    values = weights[mask] if mask is not None else weights
+                    if values.numel():
+                        action_similarity_stats[f"{name}_neg_weight_mean"] = values.mean().item()
+                        action_similarity_stats[f"{name}_neg_weight_below_0_5"] = (
+                            (values < 0.5).float().mean().item())
+
+                finite_weight_stats("cross_task", cross_weights, cross_same_scale_mask)
+                finite_weight_stats("local", local_weights)
+                finite_weight_stats("far", far_weights)
+                action_similarity_stats["effective_negative_mass"] = (
+                    cross_weights[cross_same_scale_mask].sum()
+                    + local_weights.sum() + far_weights.sum()).item() / sample_count
+                for key, values in component_values.items():
+                    action_similarity_stats[
+                        {"arm": "arm_action_distance",
+                         "gripper_state": "gripper_state_distance",
+                         "gripper_change": "gripper_change_distance",
+                         "combined": "combined_action_distance"}[key]] = (
+                            torch.stack(values).mean().item() if values else float("nan"))
+                for index, (task_name, scale) in enumerate(zip(
+                        selected_task_names or ["unknown"] * sample_count, lengths)):
+                    cross_mask = cross_same_scale_mask[index]
+                    cross_audit = None
+                    if cross_mask.any():
+                        cross_audit = {
+                            "distance": cross_distances[index, cross_mask].mean().item(),
+                            "weight": cross_weights[index, cross_mask].mean().item(),
+                            **{
+                                key: values[index, cross_mask].mean().item()
+                                for key, values in cross_components.items()
+                            },
+                        }
+                    action_similarity_audit.append({
+                        "task": str(task_name), "scale": int(scale),
+                        "cross": cross_audit,
+                        "local": {"distance": local_distances[index].item(),
+                                  "weight": local_weights[index].item(),
+                                  **{key: values[index].item()
+                                     for key, values in local_components.items()}},
+                        "far": {"distance": far_distances[index].item(),
+                                "weight": far_weights[index].item(),
+                                **{key: values[index].item()
+                                   for key, values in far_components.items()}},
+                    })
+
+                # Preserve raw diagnostics while the optimization uses weighted logits.
+                raw_cross_margin_per_sample = torch.where(
+                    torch.isfinite(raw_cross_task_family_values),
+                    positive_values - raw_cross_task_family_values,
+                    torch.full_like(positive_values, torch.nan)).float()
+                weighted_cross_margin_per_sample = torch.where(
+                    torch.isfinite(cross_task_family_values),
+                    positive_values - cross_task_family_values,
+                    torch.full_like(positive_values, torch.nan)).float()
+                weighted_local_margin_per_sample = (
+                    positive_values - weighted_temporal_values).float()
+                weighted_far_margin_per_sample = (
+                    positive_values - weighted_far_values).float()
+                cross_task_margin_per_sample = weighted_cross_margin_per_sample
+
+                def descriptor_finite_mean(values):
+                    valid = torch.isfinite(values)
+                    return (values[valid].mean() if valid.any() else nan_value)
+
+                action_similarity_stats.update({
+                    "raw_cross_task_margin": descriptor_finite_mean(
+                        raw_cross_margin_per_sample).item(),
+                    "weighted_cross_task_margin": descriptor_finite_mean(
+                        weighted_cross_margin_per_sample).item(),
+                    "raw_local_margin": descriptor_finite_mean(
+                        temporal_margin_per_sample).item(),
+                    "weighted_local_margin": descriptor_finite_mean(
+                        weighted_local_margin_per_sample).item(),
+                    "raw_far_margin": descriptor_finite_mean(
+                        far_margin_per_sample).item(),
+                    "weighted_far_margin": descriptor_finite_mean(
+                        weighted_far_margin_per_sample).item(),
+                    "raw_cross_task_acc": descriptor_finite_mean(
+                        (raw_cross_margin_per_sample > 0).float().masked_fill(
+                            ~torch.isfinite(raw_cross_margin_per_sample), torch.nan)).item(),
+                    "weighted_cross_task_acc": descriptor_finite_mean(
+                        (weighted_cross_margin_per_sample > 0).float().masked_fill(
+                            ~torch.isfinite(weighted_cross_margin_per_sample), torch.nan)).item(),
+                    "raw_local_acc": (temporal_margin_per_sample > 0).float().mean().item(),
+                    "weighted_local_acc": (
+                        weighted_local_margin_per_sample > 0).float().mean().item(),
+                    "raw_far_acc": (far_margin_per_sample > 0).float().mean().item(),
+                    "weighted_far_acc": (
+                        weighted_far_margin_per_sample > 0).float().mean().item(),
+                })
+
+            if negative_mode == "mixed":
+                # One family each for cross-task, local, far and order. The two
+                # order corruptions are log-mean-exp balanced above.
+                logits = torch.stack((
+                    positive_values,
+                    cross_task_family_values,
+                    weighted_temporal_values,
+                    weighted_far_values,
+                    order_family_values,
+                ), dim=1)
+                raw_logits = torch.stack((
+                    positive_values, raw_cross_task_family_values,
+                    temporal_values, far_values, order_family_values), dim=1)
+            else:
+                logits = torch.stack(
+                    (positive_values, temporal_values, order_family_values), dim=1)
+            labels = torch.zeros(sample_count, dtype=torch.long, device=device)
+            loss_lava_per_sample = F.cross_entropy(
+                logits / temperature, labels, reduction="none")
+            candidate_accuracy = (
+                logits.argmax(dim=1) == labels).float().mean()
+            if raw_logits is not None:
+                action_similarity_stats["raw_candidate_acc"] = (
+                    raw_logits.argmax(dim=1) == labels).float().mean().item()
+                action_similarity_stats["weighted_candidate_acc"] = (
+                    logits.argmax(dim=1) == labels).float().mean().item()
+            candidate_correct_per_sample = (
+                logits.argmax(dim=1) == labels).float()
+            retrieval_acc = candidate_accuracy
+            finite_negatives = logits[:, 1:][torch.isfinite(logits[:, 1:])]
+            negative_sim = (
+                finite_negatives.mean() if finite_negatives.numel()
+                else action_signatures.new_tensor(0.0))
+        else:
+            logits = positive_world_logits
+            labels = torch.arange(sample_count, device=device)
+            negative_sim = (
+                positive_world_logits[off_diagonal].mean()
+                if off_diagonal.any() else action_signatures.new_tensor(0.0))
+            if block_swap_signatures:
+                logits = torch.cat((
+                    logits,
+                    action_signatures @ torch.stack(block_swap_signatures).transpose(0, 1),
+                ), dim=1)
+            if derangement_signatures:
+                logits = torch.cat((
+                    logits,
+                    action_signatures @ torch.stack(derangement_signatures).transpose(0, 1),
+                ), dim=1)
+            loss_lava_per_sample = F.cross_entropy(
+                logits / temperature, labels, reduction="none")
+            retrieval_acc = (logits.argmax(dim=1) == labels).float().mean()
+
+
         loss_lava = loss_lava_per_sample.mean()
         pos_sim = positive_values.mean()
-        retrieval_acc = (logits.argmax(dim=1) == labels).float().mean()
+
+        def finite_mean(values):
+            valid = torch.isfinite(values)
+            return (values[valid].mean() if valid.any() else nan_value.clone())
+
+        block_margin_per_sample = torch.where(
+            torch.isfinite(block_values), positive_values - block_values,
+            torch.full_like(positive_values, torch.nan)).float()
+        derangement_margin_per_sample = torch.where(
+            torch.isfinite(derangement_values),
+            positive_values - derangement_values,
+            torch.full_like(positive_values, torch.nan)).float()
+        cross_task_family_sim = finite_mean(cross_task_family_values)
+        cross_task_margin = finite_mean(cross_task_margin_per_sample)
+        cross_task_acc = finite_mean(
+            (cross_task_margin_per_sample > 0).float().masked_fill(
+                ~torch.isfinite(cross_task_margin_per_sample), torch.nan))
+        far_negative_sim = finite_mean(far_values)
+        far_margin = finite_mean(far_margin_per_sample)
+        far_acc = finite_mean(
+            (far_margin_per_sample > 0).float().masked_fill(
+                ~torch.isfinite(far_margin_per_sample), torch.nan))
+        block_swap_sim = finite_mean(block_values)
+        block_swap_margin = finite_mean(block_margin_per_sample)
+        block_swap_acc = finite_mean(
+            (block_margin_per_sample > 0).float().masked_fill(
+                ~torch.isfinite(block_margin_per_sample), torch.nan))
+        derangement_sim = finite_mean(derangement_values)
+        derangement_margin = finite_mean(derangement_margin_per_sample)
+        derangement_acc = finite_mean(
+            (derangement_margin_per_sample > 0).float().masked_fill(
+                ~torch.isfinite(derangement_margin_per_sample), torch.nan))
+        order_family_sim = finite_mean(order_family_values)
+
+        hardest_family_fractions = {
+            "cross_task": float("nan"),
+            "local": float("nan"),
+            "far": float("nan"),
+            "order": float("nan"),
+        }
+        average_candidate_count = float("nan")
+        if negative_mode == "mixed":
+            negative_families = torch.stack((
+                cross_task_family_values,
+                weighted_temporal_values if self.lava_action_similarity_weighting else temporal_values,
+                weighted_far_values if self.lava_action_similarity_weighting else far_values,
+                order_family_values), dim=1)
+            valid_family = torch.isfinite(negative_families)
+            average_candidate_count = valid_family.sum(dim=1).float().mean().item()
+            has_negative = valid_family.any(dim=1)
+            if has_negative.any():
+                hardest = negative_families.masked_fill(
+                    ~valid_family, -torch.inf).argmax(dim=1)
+                names = ("cross_task", "local", "far", "order")
+                for index, name in enumerate(names):
+                    hardest_family_fractions[name] = (
+                        (hardest[has_negative] == index).float().mean().item())
+            if self.lava_action_similarity_weighting:
+                raw_negative_families = torch.stack((
+                    raw_cross_task_family_values, temporal_values,
+                    far_values, order_family_values), dim=1)
+                raw_valid = torch.isfinite(raw_negative_families)
+                raw_has_negative = raw_valid.any(dim=1)
+                raw_hardest = raw_negative_families.masked_fill(
+                    ~raw_valid, -torch.inf).argmax(dim=1)
+                for index, name in enumerate(("cross_task", "local", "far", "order")):
+                    action_similarity_stats[f"raw_hardest_{name}_fraction"] = (
+                        (raw_hardest[raw_has_negative] == index).float().mean().item())
+                    action_similarity_stats[f"weighted_hardest_{name}_fraction"] = (
+                        hardest_family_fractions[name])
 
         with torch.no_grad():
             raw_world = flat_world.float()
@@ -805,6 +1583,24 @@ class VLAModel(nn.Module):
             action_l2 = torch.stack(action_level2_raw_norms).float()
             world_l1 = torch.stack(world_level1_raw_norms).float()
             world_l2 = torch.stack(world_level2_raw_norms).float()
+            action_cal_l1 = torch.stack([
+                value["level1_calibrated_norm"] for value in action_calibration
+            ]).float()
+            action_cal_l2 = torch.stack([
+                value["level2_calibrated_norm"] for value in action_calibration
+            ]).float()
+            action_l2_energy = torch.stack([
+                value["level2_energy_fraction"] for value in action_calibration
+            ]).float()
+            world_cal_l1 = torch.stack([
+                value["level1_calibrated_norm"] for value in world_calibration
+            ]).float()
+            world_cal_l2 = torch.stack([
+                value["level2_calibrated_norm"] for value in world_calibration
+            ]).float()
+            world_l2_energy = torch.stack([
+                value["level2_energy_fraction"] for value in world_calibration
+            ]).float()
             order_eligible = interval_scales >= 2
 
             def eligible_mean(values):
@@ -837,6 +1633,12 @@ class VLAModel(nn.Module):
                 "world_logsig_l1_raw_norm": eligible_mean(world_l1),
                 "world_logsig_l2_raw_norm": eligible_mean(world_l2),
                 "world_logsig_l2_l1_ratio": eligible_ratio(world_l2, world_l1),
+                "action_logsig_l1_calibrated_norm": eligible_mean(action_cal_l1),
+                "action_logsig_l2_calibrated_norm": eligible_mean(action_cal_l2),
+                "action_logsig_l2_energy_fraction": eligible_mean(action_l2_energy),
+                "world_logsig_l1_calibrated_norm": eligible_mean(world_cal_l1),
+                "world_logsig_l2_calibrated_norm": eligible_mean(world_cal_l2),
+                "world_logsig_l2_energy_fraction": eligible_mean(world_l2_energy),
             }
 
             # LAVA aligns c_r with h_{r+1}. Record where supervision actually
@@ -861,6 +1663,38 @@ class VLAModel(nn.Module):
                     .float().mean().item()),
             })
 
+            path_end_positions = interval_starts + interval_scales
+            executed_path_mask = path_end_positions < int(action_execution_horizon)
+            tail_path_mask = ~executed_path_mask
+
+            def masked_metric(values, mask):
+                valid = mask & torch.isfinite(values)
+                return values[valid].mean().item() if valid.any() else float("nan")
+
+            diagnostics.update({
+                "lava_executed_path_ratio": executed_path_mask.float().mean().item(),
+                "loss_lava_executed": masked_metric(
+                    loss_lava_per_sample.float(), executed_path_mask),
+                "loss_lava_tail": masked_metric(
+                    loss_lava_per_sample.float(), tail_path_mask),
+                "pos_sim_executed": masked_metric(
+                    positive_values.float(), executed_path_mask),
+                "pos_sim_tail": masked_metric(
+                    positive_values.float(), tail_path_mask),
+                "candidate_acc_executed": masked_metric(
+                    candidate_correct_per_sample, executed_path_mask),
+                "candidate_acc_tail": masked_metric(
+                    candidate_correct_per_sample, tail_path_mask),
+                "local_margin_executed": masked_metric(
+                    temporal_margin_per_sample, executed_path_mask),
+                "local_margin_tail": masked_metric(
+                    temporal_margin_per_sample, tail_path_mask),
+                "order_margin_executed": masked_metric(
+                    order_margin_per_sample, executed_path_mask),
+                "order_margin_tail": masked_metric(
+                    order_margin_per_sample, tail_path_mask),
+            })
+
             for scale in (1, 2, 4, 8, 16):
                 scale_mask = interval_scales == scale
                 if scale_mask.any():
@@ -870,10 +1704,48 @@ class VLAModel(nn.Module):
                     diagnostics[f"order_margin_s{scale}"] = (
                         order_margin_per_sample[margin_mask].mean().item()
                         if margin_mask.any() else 0.0)
+                    temporal_mask = scale_mask & torch.isfinite(
+                        temporal_margin_per_sample)
+                    diagnostics[f"temporal_negative_sim_s{scale}"] = (
+                        temporal_values[temporal_mask].mean().item()
+                        if temporal_mask.any() else float("nan"))
+                    diagnostics[f"temporal_margin_s{scale}"] = (
+                        temporal_margin_per_sample[temporal_mask].mean().item()
+                        if temporal_mask.any() else float("nan"))
+                    diagnostics[f"temporal_acc_s{scale}"] = (
+                        (temporal_margin_per_sample[temporal_mask] > 0)
+                        .float().mean().item()
+                        if temporal_mask.any() else float("nan"))
+                    diagnostics[f"order_acc_s{scale}"] = (
+                        (order_margin_per_sample[margin_mask] > 0)
+                        .float().mean().item()
+                        if margin_mask.any() else float("nan"))
+                    candidate_mask = scale_mask & torch.isfinite(
+                        candidate_correct_per_sample)
+                    diagnostics[f"candidate_acc_s{scale}"] = (
+                        candidate_correct_per_sample[candidate_mask].mean().item()
+                        if candidate_mask.any() else float("nan"))
+                    diagnostics[f"far_margin_s{scale}"] = masked_metric(
+                        far_margin_per_sample, scale_mask)
+                    diagnostics[f"cross_task_margin_s{scale}"] = masked_metric(
+                        cross_task_margin_per_sample, scale_mask)
+                    diagnostics[f"block_swap_margin_s{scale}"] = masked_metric(
+                        block_margin_per_sample, scale_mask)
+                    diagnostics[f"derangement_margin_s{scale}"] = masked_metric(
+                        derangement_margin_per_sample, scale_mask)
                 else:
                     diagnostics[f"loss_s{scale}"] = 0.0
                     diagnostics[f"pos_sim_s{scale}"] = 0.0
                     diagnostics[f"order_margin_s{scale}"] = 0.0
+                    diagnostics[f"temporal_negative_sim_s{scale}"] = float("nan")
+                    diagnostics[f"temporal_margin_s{scale}"] = float("nan")
+                    diagnostics[f"temporal_acc_s{scale}"] = float("nan")
+                    diagnostics[f"order_acc_s{scale}"] = float("nan")
+                    diagnostics[f"candidate_acc_s{scale}"] = float("nan")
+                    diagnostics[f"far_margin_s{scale}"] = float("nan")
+                    diagnostics[f"cross_task_margin_s{scale}"] = float("nan")
+                    diagnostics[f"block_swap_margin_s{scale}"] = float("nan")
+                    diagnostics[f"derangement_margin_s{scale}"] = float("nan")
 
             for scale in (2, 4, 8, 16):
                 scale_mask = interval_scales == scale
@@ -884,9 +1756,29 @@ class VLAModel(nn.Module):
                     diagnostics[f"world_logsig_l2_l1_ratio_s{scale}"] = (
                         (world_l2[scale_mask] / world_l1[scale_mask].clamp_min(1e-12))
                         .mean().item())
+                    diagnostics[f"action_logsig_l2_energy_fraction_s{scale}"] = (
+                        action_l2_energy[scale_mask].mean().item())
+                    diagnostics[f"world_logsig_l2_energy_fraction_s{scale}"] = (
+                        world_l2_energy[scale_mask].mean().item())
+                    scale_index = self.lava_signature_calibrator.scale_to_index[scale]
+                    ema = self.lava_signature_calibrator.ema_squared_norm
+                    diagnostics[f"action_logsig_l1_ema_rms_s{scale}"] = (
+                        ema[0, 0, scale_index].sqrt().item())
+                    diagnostics[f"action_logsig_l2_ema_rms_s{scale}"] = (
+                        ema[0, 1, scale_index].sqrt().item())
+                    diagnostics[f"world_logsig_l1_ema_rms_s{scale}"] = (
+                        ema[1, 0, scale_index].sqrt().item())
+                    diagnostics[f"world_logsig_l2_ema_rms_s{scale}"] = (
+                        ema[1, 1, scale_index].sqrt().item())
                 else:
                     diagnostics[f"action_logsig_l2_l1_ratio_s{scale}"] = float("nan")
                     diagnostics[f"world_logsig_l2_l1_ratio_s{scale}"] = float("nan")
+                    diagnostics[f"action_logsig_l2_energy_fraction_s{scale}"] = float("nan")
+                    diagnostics[f"world_logsig_l2_energy_fraction_s{scale}"] = float("nan")
+                    diagnostics[f"action_logsig_l1_ema_rms_s{scale}"] = float("nan")
+                    diagnostics[f"action_logsig_l2_ema_rms_s{scale}"] = float("nan")
+                    diagnostics[f"world_logsig_l1_ema_rms_s{scale}"] = float("nan")
+                    diagnostics[f"world_logsig_l2_ema_rms_s{scale}"] = float("nan")
 
             timestep_labels = ("t0_025", "t025_050", "t050_075", "t075_100")
             if flow_timesteps is not None:
@@ -919,9 +1811,43 @@ class VLAModel(nn.Module):
             "same_task_negative_sim": same_task_negative_sim.detach().item(),
             "cross_task_negative_sim": cross_task_negative_sim.detach().item(),
             "task_shortcut_gap": task_shortcut_gap.detach().item(),
+            "temporal_negative_sim": temporal_negative_sim.detach().item(),
+            "temporal_margin": temporal_margin.detach().item(),
+            "temporal_acc": temporal_accuracy.detach().item(),
+            "order_acc": order_accuracy.detach().item(),
+            "candidate_acc": candidate_accuracy.detach().item(),
+            "positive_temporal_world_sim": (
+                positive_temporal_world_sim.detach().item()),
+            "positive_far_world_sim": positive_far_world_sim.detach().item(),
+            "cross_task_family_sim": cross_task_family_sim.detach().item(),
+            "cross_task_margin": cross_task_margin.detach().item(),
+            "cross_task_acc": cross_task_acc.detach().item(),
+            "far_negative_sim": far_negative_sim.detach().item(),
+            "far_margin": far_margin.detach().item(),
+            "far_acc": far_acc.detach().item(),
+            "block_swap_sim": block_swap_sim.detach().item(),
+            "block_swap_margin": block_swap_margin.detach().item(),
+            "block_swap_acc": block_swap_acc.detach().item(),
+            "derangement_sim": derangement_sim.detach().item(),
+            "derangement_margin": derangement_margin.detach().item(),
+            "derangement_acc": derangement_acc.detach().item(),
+            "order_family_sim": order_family_sim.detach().item(),
+            "average_negative_family_count": average_candidate_count,
+            "hardest_cross_task_fraction": hardest_family_fractions["cross_task"],
+            "hardest_local_fraction": hardest_family_fractions["local"],
+            "hardest_far_fraction": hardest_family_fractions["far"],
+            "hardest_order_fraction": hardest_family_fractions["order"],
+            "cross_task_candidate_count": (
+                cross_task_candidate_counts.float().mean().item()),
+            "order_candidate_count": order_candidate_counts.float().mean().item(),
             "lava_sample_count": sample_count,
-            "lava_order_negative_count": len(shuffled_action_indices),
+            # Backward-compatible: number of paths receiving order supervision,
+            # not the number of corruption candidates inside the order family.
+            "lava_order_negative_count": len(block_action_indices),
         })
+        if self.lava_action_similarity_weighting:
+            diagnostics.update(action_similarity_stats)
+            diagnostics["_action_similarity_audit"] = action_similarity_audit
         return loss_lava, diagnostics
 
 
@@ -943,6 +1869,8 @@ def calc_flow_matching_loss(
     lambda_future_feat=0.5,
     # LAVA
     world_feature_differences=None,
+    temporal_negative_feature_differences=None,
+    far_negative_feature_differences=None,
     lava_batch_indices=None,
     lava_interval_starts=None,
     lava_interval_scales=None,
@@ -950,8 +1878,15 @@ def calc_flow_matching_loss(
     lambda_lava=0.0,
     lava_temperature=0.07,
     lava_order_negative=True,
+    lava_negative_mode="batch",
     action_execution_horizon=16,
     task_names=None,
+    normalized_actions=None,
+    raw_actions=None,
+    temporal_negative_normalized_actions=None,
+    temporal_negative_raw_actions=None,
+    far_negative_normalized_actions=None,
+    far_negative_raw_actions=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -1056,6 +1991,12 @@ def calc_flow_matching_loss(
         "retrieval_acc": 0.0,
         "action_pair_sim": 0.0,
         "world_pair_sim": 0.0,
+        "temporal_negative_sim": float("nan"),
+        "temporal_margin": float("nan"),
+        "temporal_acc": float("nan"),
+        "order_acc": float("nan"),
+        "candidate_acc": float("nan"),
+        "positive_temporal_world_sim": float("nan"),
         "lava_sample_count": 0,
         "lava_order_negative_count": 0,
     }
@@ -1071,6 +2012,17 @@ def calc_flow_matching_loss(
             flow_timesteps=t,
             task_names=task_names,
             action_execution_horizon=action_execution_horizon,
+            temporal_negative_feature_differences=(
+                temporal_negative_feature_differences),
+            far_negative_feature_differences=far_negative_feature_differences,
+            negative_mode=lava_negative_mode,
+            normalized_actions=normalized_actions,
+            raw_actions=raw_actions,
+            temporal_negative_normalized_actions=(
+                temporal_negative_normalized_actions),
+            temporal_negative_raw_actions=temporal_negative_raw_actions,
+            far_negative_normalized_actions=far_negative_normalized_actions,
+            far_negative_raw_actions=far_negative_raw_actions,
         )
 
     # ==================== Total Loss ====================

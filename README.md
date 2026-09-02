@@ -20,9 +20,9 @@ $$
 $$
 
 A learnable-query World Residual encoder compresses every patch-level change to
-a 32-dimensional residual. On the action side, LAVA uses the hidden state after
-Action Expert block 6 and a shared MLP projector; the policy itself still runs
-through all 12 blocks, final normalization, and the action head. The alignment
+a 32-dimensional residual. On the action side, LAVA V5 uses the final-normalized
+hidden state immediately before the linear action head and a shared MLP
+projector. The alignment
 is offset by one step:
 
 $$
@@ -32,9 +32,23 @@ $$
 so $h_0$ is never used by LAVA.
 
 Both residual paths receive a normalized time channel and are pooled with a
-differentiable depth-2 log-signature. A one-way Action-to-World InfoNCE loss
-uses other world paths in the batch as negatives. For $L \ge 2$, an adjacent
-swap of two visual residuals is also added as an order-aware hard negative.
+differentiable depth-2 log-signature. LAVA V5 keeps four count-balanced negative
+families: cross-task same-scale paths from the current batch, a same-episode
+far path, a same-episode local path, and order corruptions. The order family
+contains a contiguous block swap and a full derangement; for $L=2$ their only
+unique permutation is included once.
+
+Cross-task, local, and far negatives are softened only when their detached,
+ground-truth action paths are similar. The descriptor combines normalized arm
+joint deltas with raw gripper state and gripper change. Order corruptions always
+retain weight 1. Each temporal scale has a family-balanced EMA distance scale:
+cross/local/far medians are computed separately and then averaged equally.
+
+The raw first- and second-level LogSignatures are calibrated by detached
+action/world-, level-, and scale-specific EMA RMS statistics. They are then
+concatenated with a fixed second-level weight of 0.5 and normalized once. This
+preserves weak-vs-strong order structure instead of forcing each path's two
+levels to unit norm independently.
 
 The training objective is
 
@@ -53,6 +67,7 @@ The defaults live in [`configs/robotwin_all.yaml`](configs/robotwin_all.yaml):
 model:
   lava:
     enabled: true
+    action_target_layer: final
     dino_target_layer: -4
     residual_dim: 32
     qformer:
@@ -61,17 +76,31 @@ model:
       num_layers: 2
       num_heads: 4
     logsig_depth: 2
+    signature_normalization:
+      type: ema_calibrated
+      ema_momentum: 0.99
+      level2_weight: 0.5
 
 training:
   lambda_lava: 0.01
   lava_temperature: 0.07
   lava_scales: [1, 2, 4, 8, 16]
-  lava_sample_ratio: 0.25
-  lava_scale_sampling: uniform
-  lava_sampling_balance: none
+  lava_sample_ratio: 0.125
+  lava_scale_sampling: batch_uniform
+  lava_sampling_balance: task_episode
+  lava_negative_mode: mixed
+  lava_negative_window_multiplier: 4
+  lava_negative_window_max: 32
   lava_warmup_ratio: 0.05
   lava_order_negative: true
   lava_grad_diagnostics_interval: 200
+  lava_action_similarity_weighting: true
+  lava_action_similarity_min_weight: 0.1
+  lava_action_similarity_beta_momentum: 0.99
+  lava_action_similarity_beta_multiplier: 1.0
+  lava_action_gripper_indices: [6, 13]
+  lava_action_gripper_state_weight: 0.5
+  lava_action_gripper_change_weight: 0.5
 ```
 
 `lava_sampling_balance: task_episode` keeps the base flow/future DataLoader
@@ -80,13 +109,18 @@ and then across episodes within each task. The provided RoboTwin Slurm scripts
 enable this mode explicitly and write an actual per-task sampling audit after
 every epoch.
 
+`mixed` mode uses `lava_sample_ratio: 0.125`, a local search radius
+$R(L)=\min(4L,32)$, and a far path outside that radius. Cross-task candidates
+reuse positive paths already encoded for the batch; order corruptions reuse
+the positive residual path and therefore require no extra DINO forward.
+
 The fixed method choices are:
 
 - frozen DINOv3 targets from layer `-4`;
-- Action Expert block-6 hidden states (the policy still executes all 12 blocks);
+- final-normalized hidden states before the action head;
 - visual differences `Z[t+1] - Z[t]`;
 - normalized time augmentation;
-- one-way Action-to-World InfoNCE;
+- one-way Action-to-World mixed-family candidate contrast;
 - a shared action projector across positions and scales;
 - no LAVA execution during policy inference.
 
@@ -164,17 +198,29 @@ memory. The most important diagnostics are:
 Loss_Flow, Loss_Future, Loss_LAVA, Lambda_LAVA
 Loss_Base, Weighted_LAVA, LAVA_Base_Ratio
 Pos_Sim, Negative_Sim, Shuffle_Sim, Order_Margin, Retrieval_Acc
+Temporal_Neg_Sim, Temporal_Margin, Temporal_Acc
+Order_Acc, Candidate_Acc, Positive_Temporal_World_Sim
+Cross_Task/Far/Block_Swap/Derangement_Sim, Margin, Acc
+Hardest_Cross_Task/Local/Far/Order_Fraction
+Negative_Distance_Over_L, Far_Negative_Distance_Over_L, Dropped_Pair_Rate
 Same_Task_Neg_Sim, Cross_Task_Neg_Sim, Task_Shortcut_Gap
 Loss_S1/S2/S4/S8/S16
 Pos_Sim_S1/S2/S4/S8/S16
 Order_Margin_S1/S2/S4/S8/S16
 Action/World_LogSig_L1/L2_Raw_Norm, Action/World_LogSig_L2_L1_Ratio
+Action/World_LogSig_L1/L2_Calibrated_Norm, L2_Energy_Fraction
+Loss_LAVA/Pos_Sim/Candidate_Acc/Local_Margin/Order_Margin_Executed/Tail
 Grad_Norm, Grad_Norm_LAVA_Branch
 Grad_Cos_Shared, Grad_Norm_Base/LAVA_Shared, Weighted_Grad_Ratio
+Arm/Gripper_State/Gripper_Change/Combined_Action_Distance
+CrossTask/Local/Far_Neg_Weight_Mean, Effective_Negative_Mass
+Raw/Weighted_CrossTask/Local/Far_Margin/Acc
 ```
 
-`Order_Margin` is the paired cosine difference between the correctly ordered
-world path and a full-shuffle derangement that moves every path position.
+`Order_Margin` uses the count-balanced order family containing a contiguous
+block swap and a full derangement. Per-corruption metrics remain available in
+the CSV so the structured and destructive order tests can be studied
+separately.
 Scale 1 has no order negative. Shared-gradient diagnostics run every 200
 optimizer steps; their CSV fields are `nan` on non-diagnostic steps.
 

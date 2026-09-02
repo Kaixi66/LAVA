@@ -22,6 +22,10 @@ PYTHON_BIN="${PYTHON_BIN:-${WORKSPACE_ROOT}/.conda/envs/lila-wam/bin/python}"
 DINO_MODEL="${DINO_MODEL:-${WORKSPACE_ROOT}/data/models/dinov3-vitl16-pretrain-lvd1689m}"
 RUN_NAME="${SLURM_JOB_NAME}"
 RUN_SAVE_DIR="${SAVE_ROOT}/${RUN_NAME}"
+LAVA_ACTION_TARGET_LAYER="${LAVA_ACTION_TARGET_LAYER:-final}"
+LAVA_WEIGHT_SCHEDULE="${LAVA_WEIGHT_SCHEDULE:-constant}"
+LAVA_MIN_WEIGHT="${LAVA_MIN_WEIGHT:-0.0}"
+LAVA_DECAY_START_RATIO="${LAVA_DECAY_START_RATIO:-1.0}"
 
 find_latest_checkpoint() {
   local search_dir="$1" pattern="$2" max_epoch="$3"
@@ -119,6 +123,7 @@ OVERRIDES=(
   "dataset.task_set=${TASK_SET}"
   "model.vision_encoder.checkpoint_path=${DINO_MODEL}"
   "model.lava.enabled=true"
+  "model.lava.action_target_layer=${LAVA_ACTION_TARGET_LAYER}"
   "model.lava.logsig_depth=${LAVA_LOGSIG_DEPTH}"
   "training.epochs=${EPOCHS}"
   "training.learning_rate=${LEARNING_RATE}"
@@ -133,9 +138,22 @@ OVERRIDES=(
   "training.lava_temperature=${LAVA_TEMPERATURE}"
   "training.lava_sample_ratio=${LAVA_SAMPLE_RATIO}"
   "training.lava_sampling_balance=${LAVA_SAMPLING_BALANCE}"
+  "training.lava_negative_mode=${LAVA_NEGATIVE_MODE}"
+  "training.lava_negative_window_multiplier=${LAVA_NEGATIVE_WINDOW_MULTIPLIER}"
+  "training.lava_negative_window_max=${LAVA_NEGATIVE_WINDOW_MAX}"
   "training.lava_warmup_ratio=${LAVA_WARMUP_RATIO}"
+  "training.lava_weight_schedule=${LAVA_WEIGHT_SCHEDULE}"
+  "training.lava_min_weight=${LAVA_MIN_WEIGHT}"
+  "training.lava_decay_start_ratio=${LAVA_DECAY_START_RATIO}"
   "training.lava_scale_sampling=${LAVA_SCALE_SAMPLING}"
   "training.lava_order_negative=${LAVA_ORDER_NEGATIVE}"
+  "training.lava_action_similarity_weighting=${LAVA_ACTION_SIMILARITY_WEIGHTING:-false}"
+  "training.lava_action_similarity_min_weight=${LAVA_ACTION_SIMILARITY_MIN_WEIGHT:-0.1}"
+  "training.lava_action_similarity_beta_momentum=${LAVA_ACTION_SIMILARITY_BETA_MOMENTUM:-0.99}"
+  "training.lava_action_similarity_beta_multiplier=${LAVA_ACTION_SIMILARITY_BETA_MULTIPLIER:-1.0}"
+  "training.lava_action_gripper_indices=${LAVA_ACTION_GRIPPER_INDICES:-[6,13]}"
+  "training.lava_action_gripper_state_weight=${LAVA_ACTION_GRIPPER_STATE_WEIGHT:-0.5}"
+  "training.lava_action_gripper_change_weight=${LAVA_ACTION_GRIPPER_CHANGE_WEIGHT:-0.5}"
 )
 
 mkdir -p "${RUN_SAVE_DIR}"
@@ -147,7 +165,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "Job ${SLURM_JOB_ID} | run ${RUN_NAME} | ${STAGE} | task set ${TASK_SET}"
-echo "LAVA lambda=${LAMBDA_LAVA} scales=${LAVA_SCALES} tau=${LAVA_TEMPERATURE} ratio=${LAVA_SAMPLE_RATIO} balance=${LAVA_SAMPLING_BALANCE}"
+echo "LAVA V5 lambda=${LAMBDA_LAVA} schedule=${LAVA_WEIGHT_SCHEDULE} min=${LAVA_MIN_WEIGHT} decay_start=${LAVA_DECAY_START_RATIO} action_tap=${LAVA_ACTION_TARGET_LAYER} scales=${LAVA_SCALES} scale_sampling=${LAVA_SCALE_SAMPLING} tau=${LAVA_TEMPERATURE} ratio=${LAVA_SAMPLE_RATIO} balance=${LAVA_SAMPLING_BALANCE} action_similarity=${LAVA_ACTION_SIMILARITY_WEIGHTING:-false} negatives=cross-task+far+local+block-swap+derangement normalization=ema-calibrated radius=min(${LAVA_NEGATIVE_WINDOW_MULTIPLIER}L,${LAVA_NEGATIVE_WINDOW_MAX})"
 echo "Output: ${RUN_SAVE_DIR}"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 

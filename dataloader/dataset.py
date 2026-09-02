@@ -14,6 +14,7 @@ from pathlib import Path
 import warnings
 import torchvision.transforms as T
 from PIL import Image
+from torch.utils.data import Sampler
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*multichannel.*")
 
@@ -40,6 +41,88 @@ ROBOTWIN_TASK_SETS = {
 # ImageNet normalization (DINOv3 uses ImageNet stats)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+class LAVABatchScaleBatchSampler(Sampler):
+    """Shuffle indices and attach one forced LAVA scale to every item in a batch.
+
+    Scale scheduling lives in the main process (not Dataset workers), so worker
+    prefetch cannot turn a nominally batch-uniform schedule into mixed scales.
+    A random permutation of all scales is exhausted before the next permutation.
+    """
+
+    def __init__(self, dataset_size, batch_size, scales, seed=0, drop_last=True):
+        self.dataset_size = int(dataset_size)
+        self.batch_size = int(batch_size)
+        self.scales = tuple(int(scale) for scale in scales)
+        self.drop_last = bool(drop_last)
+        if self.dataset_size < 1 or self.batch_size < 1 or not self.scales:
+            raise ValueError("dataset_size, batch_size, and scales must be non-empty")
+        self.generator = torch.Generator().manual_seed(int(seed))
+        self.scale_permutation = []
+        self.scale_cursor = 0
+        self.epoch = 0
+        self.batch_position = 0
+        self.epoch_indices = []
+
+    def __len__(self):
+        if self.drop_last:
+            return self.dataset_size // self.batch_size
+        return (self.dataset_size + self.batch_size - 1) // self.batch_size
+
+    def _next_scale(self):
+        if self.scale_cursor >= len(self.scale_permutation):
+            order = torch.randperm(len(self.scales), generator=self.generator).tolist()
+            self.scale_permutation = [self.scales[index] for index in order]
+            self.scale_cursor = 0
+        scale = self.scale_permutation[self.scale_cursor]
+        self.scale_cursor += 1
+        return scale
+
+    def __iter__(self):
+        if not self.epoch_indices:
+            self.epoch_indices = torch.randperm(
+                self.dataset_size, generator=self.generator).tolist()
+        indices = self.epoch_indices
+        batch_count = len(self)
+        start_batch = self.batch_position
+        for batch_index in range(start_batch, batch_count):
+            begin = batch_index * self.batch_size
+            batch = indices[begin:begin + self.batch_size]
+            if len(batch) < self.batch_size and self.drop_last:
+                break
+            scale = self._next_scale()
+            self.batch_position = batch_index + 1
+            yield [(index, scale) for index in batch]
+        self.epoch += 1
+        self.batch_position = 0
+        self.epoch_indices = []
+
+    def state_dict(self):
+        return {
+            "generator_state": self.generator.get_state(),
+            "scale_permutation": list(self.scale_permutation),
+            "scale_cursor": int(self.scale_cursor),
+            "epoch": int(self.epoch),
+            "batch_position": int(self.batch_position),
+            "epoch_indices": list(self.epoch_indices),
+        }
+
+    def load_state_dict(self, state):
+        required = {"generator_state", "scale_permutation", "scale_cursor",
+                    "epoch", "batch_position", "epoch_indices"}
+        missing = required.difference(state)
+        if missing:
+            raise KeyError(f"Incomplete LAVA batch sampler state: missing {sorted(missing)}")
+        permutation = [int(value) for value in state["scale_permutation"]]
+        if any(value not in self.scales for value in permutation):
+            raise ValueError("Sampler state contains scales absent from this configuration")
+        self.generator.set_state(state["generator_state"])
+        self.scale_permutation = permutation
+        self.scale_cursor = int(state["scale_cursor"])
+        self.epoch = int(state["epoch"])
+        self.batch_position = int(state["batch_position"])
+        self.epoch_indices = [int(value) for value in state["epoch_indices"]]
 
 
 def _decode(buf):
@@ -69,7 +152,10 @@ class RobotWinTaskDataset(data.Dataset):
                  task_set="50",
                  use_lava=False, lava_scales=None, lava_sample_ratio=0.25,
                  lava_scale_sampling="uniform", lava_scale_probs=None,
-                 lava_sampling_balance="none"):
+                 lava_sampling_balance="none", lava_negative_mode="batch",
+                 lava_negative_window_multiplier=4,
+                 lava_negative_window_max=32,
+                 lava_action_similarity_weighting=False):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -92,11 +178,16 @@ class RobotWinTaskDataset(data.Dataset):
             use_lava: return a sampled multi-scale frame evolution path
             lava_scales: candidate temporal intervals in action-token steps
             lava_sample_ratio: probability that a dataset sample receives LAVA supervision
-            lava_scale_sampling: "uniform" or "weighted"
+            lava_scale_sampling: "uniform", "weighted", or "batch_uniform"
             lava_scale_probs: probabilities corresponding to lava_scales in weighted mode
             lava_sampling_balance: "none" preserves frame-uniform sampling; "task"
                                    equalizes expected LAVA samples across tasks; and
                                    "task_episode" also equalizes episodes within each task
+            lava_negative_mode: "batch" uses the legacy batch-wide denominator;
+                                "episode_local" adds one same-episode local negative;
+                                "mixed" adds local and far same-episode negatives
+            lava_negative_window_multiplier: local negative search radius in units of L
+            lava_negative_window_max: maximum local negative search radius in frames
         """
         if indices_config is None:
             raise ValueError("indices_config is required")
@@ -140,6 +231,11 @@ class RobotWinTaskDataset(data.Dataset):
         self.lava_scale_sampling = str(lava_scale_sampling)
         self.lava_scale_probs = None if lava_scale_probs is None else tuple(float(p) for p in lava_scale_probs)
         self.lava_sampling_balance = str(lava_sampling_balance).lower()
+        self.lava_negative_mode = str(lava_negative_mode).lower()
+        self.lava_negative_window_multiplier = int(lava_negative_window_multiplier)
+        self.lava_negative_window_max = int(lava_negative_window_max)
+        self.lava_action_similarity_weighting = bool(
+            lava_action_similarity_weighting)
         if self.use_lava:
             if not 0.0 <= self.lava_sample_ratio <= 1.0:
                 raise ValueError(f"lava_sample_ratio must be in [0,1], got {self.lava_sample_ratio}")
@@ -150,9 +246,10 @@ class RobotWinTaskDataset(data.Dataset):
             if not torch.equal(self.action_offsets, torch.arange(self.chunk_size)):
                 raise ValueError(
                     "LAVA requires contiguous action_indices [0, ..., chunk_size-1] for temporal alignment")
-            if self.lava_scale_sampling not in {"uniform", "weighted"}:
+            if self.lava_scale_sampling not in {"uniform", "weighted", "batch_uniform"}:
                 raise ValueError(
-                    f"lava_scale_sampling must be 'uniform' or 'weighted', got {self.lava_scale_sampling}")
+                    "lava_scale_sampling must be 'uniform', 'weighted', or "
+                    f"'batch_uniform', got {self.lava_scale_sampling}")
             if self.lava_scale_sampling == "weighted":
                 if self.lava_scale_probs is None or len(self.lava_scale_probs) != len(self.lava_scales):
                     raise ValueError("weighted LAVA scale sampling requires one probability per scale")
@@ -162,6 +259,17 @@ class RobotWinTaskDataset(data.Dataset):
                 raise ValueError(
                     "lava_sampling_balance must be one of 'none', 'task', or "
                     f"'task_episode', got {self.lava_sampling_balance}")
+            if self.lava_negative_mode not in {"batch", "episode_local", "mixed"}:
+                raise ValueError(
+                    "lava_negative_mode must be 'batch', 'episode_local', or "
+                    "'mixed', got "
+                    f"{self.lava_negative_mode}")
+            if self.lava_negative_window_multiplier < 1:
+                raise ValueError("lava_negative_window_multiplier must be >= 1")
+            if self.lava_negative_window_max < max(self.lava_scales):
+                raise ValueError(
+                    "lava_negative_window_max must be at least the largest LAVA scale "
+                    f"({max(self.lava_scales)}), got {self.lava_negative_window_max}")
 
         # Task condition vector directory
         self.task_cond_dir = task_cond_dir
@@ -196,7 +304,9 @@ class RobotWinTaskDataset(data.Dataset):
             logger.info(
                 f"LAVA sampling ENABLED: scales={list(self.lava_scales)}, "
                 f"sample_ratio={self.lava_sample_ratio}, scale_sampling={self.lava_scale_sampling}, "
-                f"balance={self.lava_sampling_balance}.")
+                f"balance={self.lava_sampling_balance}, negative_mode={self.lava_negative_mode}, "
+                f"negative_radius=min({self.lava_negative_window_multiplier}L, "
+                f"{self.lava_negative_window_max}).")
 
     @staticmethod
     def _equalized_expected_counts(capacities, requested_total):
@@ -227,6 +337,8 @@ class RobotWinTaskDataset(data.Dataset):
         episode_count = len(self.episode_metadata)
         self._lava_episode_probabilities = np.full(
             episode_count, self.lava_sample_ratio, dtype=np.float64)
+        self._lava_episode_probabilities_by_scale = {
+            scale: self._lava_episode_probabilities.copy() for scale in self.lava_scales}
         self.lava_sampling_summary = {}
         if not self.use_lava or self.lava_sampling_balance == "none":
             return
@@ -281,6 +393,35 @@ class RobotWinTaskDataset(data.Dataset):
         if np.any(probabilities < 0) or np.any(probabilities > 1 + 1e-9):
             raise RuntimeError("Invalid task-balanced LAVA sampling probability")
         self._lava_episode_probabilities = np.clip(probabilities, 0.0, 1.0)
+        # Batch-uniform scheduling changes eligibility with L. Calibrate each
+        # scale independently so long paths do not silently favor long episodes/tasks.
+        if getattr(self, "lava_scale_sampling", "uniform") == "batch_uniform":
+            for scale in self.lava_scales:
+                eligible = np.asarray([
+                    max(0, int(meta['length']) - int(scale))
+                    for meta in self.episode_metadata
+                ], dtype=np.float64)
+                task_capacities = np.asarray([
+                    eligible[episode_indices_by_task[name]].sum()
+                    for name in task_names
+                ], dtype=np.float64)
+                targets = self._equalized_expected_counts(
+                    task_capacities, self.lava_sample_ratio * float(eligible.sum()))
+                per_episode = np.zeros(episode_count, dtype=np.float64)
+                for task_index, task_name in enumerate(task_names):
+                    episode_indices = episode_indices_by_task[task_name]
+                    capacities = eligible[episode_indices]
+                    if self.lava_sampling_balance == "task":
+                        total = capacities.sum()
+                        allocations = capacities * (targets[task_index] / total if total else 0.0)
+                    else:
+                        allocations = self._equalized_expected_counts(
+                            capacities, targets[task_index])
+                    per_episode[episode_indices] = np.divide(
+                        allocations, capacities, out=np.zeros_like(allocations),
+                        where=capacities > 0)
+                self._lava_episode_probabilities_by_scale[scale] = np.clip(
+                    per_episode, 0.0, 1.0)
         logger.info(
             "LAVA sampling balance=%s targets %.1f samples/epoch across %d tasks "
             "(%.1f total).",
@@ -301,7 +442,8 @@ class RobotWinTaskDataset(data.Dataset):
                 summary['max_episode_probability'],
             )
 
-    def _sample_lava_interval(self, local_anchor_idx, total_frames, episode_idx=None):
+    def _sample_lava_interval(self, local_anchor_idx, total_frames, episode_idx=None,
+                              forced_scale=None):
         """Return (start, scale) fully contained in both episode and action chunk."""
         if not self.use_lava:
             return None
@@ -309,7 +451,10 @@ class RobotWinTaskDataset(data.Dataset):
         if self.lava_sampling_balance != "none":
             if episode_idx is None:
                 raise ValueError("episode_idx is required for balanced LAVA sampling")
-            sample_probability = float(self._lava_episode_probabilities[episode_idx])
+            probabilities = self._lava_episode_probabilities
+            if forced_scale is not None:
+                probabilities = self._lava_episode_probabilities_by_scale[int(forced_scale)]
+            sample_probability = float(probabilities[episode_idx])
         if random.random() >= sample_probability:
             return None
         max_transition = min(self.chunk_size - 1, total_frames - 1 - local_anchor_idx)
@@ -317,7 +462,11 @@ class RobotWinTaskDataset(data.Dataset):
         if not available:
             return None
 
-        if self.lava_scale_sampling == "uniform":
+        if forced_scale is not None:
+            scale = int(forced_scale)
+            if scale not in available:
+                return None
+        elif self.lava_scale_sampling in {"uniform", "batch_uniform"}:
             scale = random.choice(available)
         else:
             probability_by_scale = dict(zip(self.lava_scales, self.lava_scale_probs))
@@ -325,6 +474,102 @@ class RobotWinTaskDataset(data.Dataset):
             scale = random.choices(available, weights=weights, k=1)[0]
         start = random.randint(0, max_transition - scale)
         return start, scale
+
+    def _sample_temporal_negative_start(self, positive_start, scale, total_frames):
+        """Sample a same-scale, non-overlapping interval from the same episode."""
+        max_start = total_frames - scale - 1
+        if max_start < 0:
+            return None, False
+        radius = min(
+            self.lava_negative_window_multiplier * scale,
+            self.lava_negative_window_max,
+        )
+
+        def non_overlapping(start):
+            return (start + scale <= positive_start
+                    or positive_start + scale <= start)
+
+        local_lower = max(0, positive_start - radius)
+        local_upper = min(max_start, positive_start + radius)
+        local_candidates = [
+            start for start in range(local_lower, local_upper + 1)
+            if non_overlapping(start)
+        ]
+        if local_candidates:
+            return random.choice(local_candidates), False
+
+        global_candidates = [
+            start for start in range(max_start + 1)
+            if non_overlapping(start)
+        ]
+        if global_candidates:
+            return random.choice(global_candidates), True
+        return None, True
+
+    def _sample_far_negative_start(self, positive_start, scale, total_frames,
+                                   exclude_starts=()):
+        """Sample a non-overlapping interval outside the local-negative radius."""
+        max_start = total_frames - scale - 1
+        if max_start < 0:
+            return None
+        radius = min(
+            self.lava_negative_window_multiplier * scale,
+            self.lava_negative_window_max,
+        )
+
+        def non_overlapping(start):
+            return (start + scale <= positive_start
+                    or positive_start + scale <= start)
+
+        excluded = set(int(start) for start in exclude_starts)
+        candidates = [
+            start for start in range(max_start + 1)
+            if non_overlapping(start)
+            and abs(start - positive_start) > radius
+            and start not in excluded
+        ]
+        return random.choice(candidates) if candidates else None
+
+    def _sample_lava_contrastive_pair(self, local_anchor_idx, total_frames,
+                                      episode_idx=None, forced_scale=None):
+        """Return a positive interval and its episode-local negative paths."""
+        interval = self._sample_lava_interval(
+            local_anchor_idx, total_frames, episode_idx=episode_idx,
+            forced_scale=forced_scale)
+        if interval is None:
+            return None
+        positive_rel_start, scale = interval
+        positive_abs_start = local_anchor_idx + positive_rel_start
+        negative_abs_start, used_global_fallback = self._sample_temporal_negative_start(
+            positive_abs_start, scale, total_frames)
+        far_negative_abs_start = None
+        negative_mode = getattr(self, "lava_negative_mode", "episode_local")
+        if negative_mode == "mixed":
+            far_negative_abs_start = self._sample_far_negative_start(
+                positive_abs_start, scale, total_frames,
+                exclude_starts=(negative_abs_start,))
+        if (negative_abs_start is None
+                or (negative_mode == "mixed"
+                    and far_negative_abs_start is None)):
+            return {
+                'dropped': True,
+                'positive_rel_start': positive_rel_start,
+                'positive_abs_start': positive_abs_start,
+                'scale': scale,
+            }
+        return {
+            'dropped': False,
+            'positive_rel_start': positive_rel_start,
+            'positive_abs_start': positive_abs_start,
+            'negative_abs_start': negative_abs_start,
+            'scale': scale,
+            'used_global_fallback': used_global_fallback,
+            'negative_distance': abs(negative_abs_start - positive_abs_start),
+            'far_negative_abs_start': far_negative_abs_start,
+            'far_negative_distance': (
+                abs(far_negative_abs_start - positive_abs_start)
+                if far_negative_abs_start is not None else None),
+        }
 
     def _build_index_map(self):
         """Iterate over all episodes, collect metadata and build the flat index"""
@@ -517,28 +762,57 @@ class RobotWinTaskDataset(data.Dataset):
                         ])
                     data_batch['future_frame'] = fut_img   # (1, H, W, 3) uint8 RGB
 
-            # LAVA evolution frames: primary camera, no color augmentation.
-            if self.use_lava and 'evolution_frames' in query_indices:
+            # LAVA positive/local/far evolution frames: primary camera,
+            # decoded together from the same HDF5 episode without augmentation.
+            evolution_keys = [
+                key for key in (
+                    'evolution_frames', 'temporal_negative_frames',
+                    'far_negative_frames')
+                if key in query_indices
+            ]
+            if self.use_lava and evolution_keys:
                 cam0 = self.camera_names[0]
                 if cam0 in root['observation']:
-                    t_idx_e = np.array(query_indices['evolution_frames'])
+                    lengths = [len(query_indices[key]) for key in evolution_keys]
+                    t_idx_e = np.concatenate([
+                        np.asarray(query_indices[key]) for key in evolution_keys
+                    ])
                     h5_idx_e = np.unique(t_idx_e)
                     comp_e = root['observation'][cam0]['rgb'][h5_idx_e]
                     decoded_e = np.stack([_decode(img) for img in comp_e])
-                    evolution_img = np.ascontiguousarray(
+                    all_evolution_img = np.ascontiguousarray(
                         decoded_e[np.searchsorted(h5_idx_e, t_idx_e)])
-                    if (evolution_img.shape[2], evolution_img.shape[1]) != self.image_size:
-                        evolution_img = np.stack([
+                    if ((all_evolution_img.shape[2], all_evolution_img.shape[1])
+                            != self.image_size):
+                        all_evolution_img = np.stack([
                             cv2.resize(i, self.image_size, interpolation=cv2.INTER_LINEAR)
-                            for i in evolution_img
+                            for i in all_evolution_img
                         ])
-                    data_batch['evolution_frames'] = evolution_img
+                    offset = 0
+                    for key, length in zip(evolution_keys, lengths):
+                        data_batch[key] = np.ascontiguousarray(
+                            all_evolution_img[offset:offset + length])
+                        offset += length
+            action_path_keys = [
+                key for key in ('temporal_negative_actions', 'far_negative_actions')
+                if key in query_indices
+            ]
+            if self.use_lava and action_path_keys:
+                for key in action_path_keys:
+                    t_idx_a = np.asarray(query_indices[key])
+                    h5_idx_a = np.unique(t_idx_a)
+                    data_batch[key] = torch.from_numpy(
+                        root['joint_action']['vector'][h5_idx_a][
+                            np.searchsorted(h5_idx_a, t_idx_a)]).float()
         return data_batch
 
     def __len__(self) -> int:
         return len(self.valid_indices)
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+        forced_scale = None
+        if isinstance(idx, (tuple, list)):
+            idx, forced_scale = int(idx[0]), int(idx[1])
         global_curr_idx = self.valid_indices[idx]
         ep_idx = np.searchsorted(self._ep_end_bounds, global_curr_idx, side='right')
         ep_meta = self.episode_metadata[ep_idx]
@@ -552,14 +826,48 @@ class RobotWinTaskDataset(data.Dataset):
 
             query_indices, padding_mask = self._get_query_indices(local_anchor_idx, total_frames)
 
-            lava_interval = self._sample_lava_interval(
-                local_anchor_idx, total_frames, episode_idx=ep_idx)
+            lava_pair_dropped = False
+            lava_interval = None
+            lava_pair = None
+            if self.lava_negative_mode in {'episode_local', 'mixed'}:
+                lava_pair = self._sample_lava_contrastive_pair(
+                    local_anchor_idx, total_frames, episode_idx=ep_idx,
+                    forced_scale=forced_scale)
+                if lava_pair is not None and lava_pair['dropped']:
+                    lava_pair_dropped = True
+                    lava_pair = None
+                if lava_pair is not None:
+                    lava_interval = (
+                        lava_pair['positive_rel_start'], lava_pair['scale'])
+            else:
+                lava_interval = self._sample_lava_interval(
+                    local_anchor_idx, total_frames, episode_idx=ep_idx,
+                    forced_scale=forced_scale)
             if lava_interval is not None:
                 lava_start, lava_scale = lava_interval
                 query_indices['evolution_frames'] = list(range(
                     local_anchor_idx + lava_start,
                     local_anchor_idx + lava_start + lava_scale + 1,
                 ))
+                if lava_pair is not None:
+                    negative_start = lava_pair['negative_abs_start']
+                    query_indices['temporal_negative_frames'] = list(range(
+                        negative_start,
+                        negative_start + lava_scale + 1,
+                    ))
+                    if self.lava_action_similarity_weighting:
+                        query_indices['temporal_negative_actions'] = list(range(
+                            negative_start, negative_start + lava_scale + 1))
+                    far_negative_start = lava_pair.get('far_negative_abs_start')
+                    if far_negative_start is not None:
+                        query_indices['far_negative_frames'] = list(range(
+                            far_negative_start,
+                            far_negative_start + lava_scale + 1,
+                        ))
+                        if self.lava_action_similarity_weighting:
+                            query_indices['far_negative_actions'] = list(range(
+                                far_negative_start,
+                                far_negative_start + lava_scale + 1))
 
             # Future frame query index (single frame, anchor + offset)
             if self.use_future_feat:
@@ -605,6 +913,9 @@ class RobotWinTaskDataset(data.Dataset):
                 # Diagnostic metadata only; it is never used as a model input.
                 'task_name': ep_meta['task_name'],
             }
+            if self.use_lava:
+                result['lava_pair_dropped'] = torch.tensor(
+                    int(lava_pair_dropped), dtype=torch.long)
 
             # Future-frame pixel_values (no color augmentation; keep the supervision target clean)
             if self.use_future_feat and 'future_frame' in data_batch:
@@ -622,6 +933,29 @@ class RobotWinTaskDataset(data.Dataset):
                 result['evolution_pixel_values'] = torch.from_numpy(evolution_normed).float()
                 result['evolution_start'] = lava_start
                 result['evolution_scale'] = lava_scale
+                if (lava_pair is not None
+                        and 'temporal_negative_frames' in data_batch):
+                    negative_np = data_batch['temporal_negative_frames']
+                    negative_normed = np.stack(
+                        [_normalize_image(img) for img in negative_np], axis=0)
+                    result['temporal_negative_pixel_values'] = torch.from_numpy(
+                        negative_normed).float()
+                    result['temporal_negative_distance'] = int(
+                        lava_pair['negative_distance'])
+                    result['temporal_negative_actions'] = data_batch[
+                        'temporal_negative_actions']
+                    result['temporal_negative_local_fallback'] = bool(
+                        lava_pair['used_global_fallback'])
+                    if 'far_negative_frames' in data_batch:
+                        far_negative_np = data_batch['far_negative_frames']
+                        far_negative_normed = np.stack(
+                            [_normalize_image(img) for img in far_negative_np], axis=0)
+                        result['far_negative_pixel_values'] = torch.from_numpy(
+                            far_negative_normed).float()
+                        result['far_negative_distance'] = int(
+                            lava_pair['far_negative_distance'])
+                        result['far_negative_actions'] = data_batch[
+                            'far_negative_actions']
 
             # Task condition vector (looked up by the episode's task_name)
             if self.use_task_cond:
@@ -632,7 +966,9 @@ class RobotWinTaskDataset(data.Dataset):
 
         except Exception as e:
             logger.warning(f"Error loading idx {idx}: {e}")
-            return self.__getitem__(random.randint(0, len(self) - 1))
+            retry_index = random.randint(0, len(self) - 1)
+            return self.__getitem__((retry_index, forced_scale)
+                                    if forced_scale is not None else retry_index)
 
 
 def create_dataset(config: Any, val: bool = False):
@@ -666,6 +1002,11 @@ def create_dataset(config: Any, val: bool = False):
     lava_sample_ratio = float(config.training.get('lava_sample_ratio', 0.25))
     lava_scale_sampling = str(config.training.get('lava_scale_sampling', 'uniform'))
     lava_sampling_balance = str(config.training.get('lava_sampling_balance', 'none'))
+    lava_negative_mode = str(config.training.get('lava_negative_mode', 'batch'))
+    lava_negative_window_multiplier = int(
+        config.training.get('lava_negative_window_multiplier', 4))
+    lava_negative_window_max = int(
+        config.training.get('lava_negative_window_max', 32))
     lava_scale_probs = config.training.get('lava_scale_probs', None)
     if lava_scale_probs is not None:
         lava_scale_probs = list(lava_scale_probs)
@@ -688,6 +1029,11 @@ def create_dataset(config: Any, val: bool = False):
         'lava_scale_sampling': lava_scale_sampling,
         'lava_scale_probs': lava_scale_probs,
         'lava_sampling_balance': lava_sampling_balance,
+        'lava_negative_mode': lava_negative_mode,
+        'lava_negative_window_multiplier': lava_negative_window_multiplier,
+        'lava_negative_window_max': lava_negative_window_max,
+        'lava_action_similarity_weighting': bool(config.training.get(
+            'lava_action_similarity_weighting', False)),
     }
 
     return RobotWinTaskDataset(**params)
@@ -699,7 +1045,13 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         return None
 
     result = {}
-    lava_keys = {'evolution_pixel_values', 'evolution_start', 'evolution_scale'}
+    lava_keys = {
+        'evolution_pixel_values', 'temporal_negative_pixel_values',
+        'far_negative_pixel_values',
+        'evolution_start', 'evolution_scale', 'temporal_negative_distance',
+        'far_negative_distance', 'temporal_negative_local_fallback',
+        'temporal_negative_actions', 'far_negative_actions',
+    }
     keys = [key for key in batch[0].keys() if key not in lava_keys]
 
     for key in keys:
@@ -719,16 +1071,71 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
     if lava_samples:
         result['evolution_pixel_values'] = [
             sample['evolution_pixel_values'] for _, sample in lava_samples]
+        temporal_negative_samples = [
+            sample.get('temporal_negative_pixel_values')
+            for _, sample in lava_samples
+        ]
+        has_temporal_negatives = all(
+            sample is not None for sample in temporal_negative_samples)
+        if any(sample is not None for sample in temporal_negative_samples) \
+                and not has_temporal_negatives:
+            raise ValueError(
+                "A LAVA batch cannot mix batch-negative and episode-local samples")
+        result['temporal_negative_pixel_values'] = (
+            temporal_negative_samples if has_temporal_negatives else None)
+        temporal_action_samples = [
+            sample.get('temporal_negative_actions') for _, sample in lava_samples]
+        has_temporal_actions = all(
+            sample is not None for sample in temporal_action_samples)
+        result['temporal_negative_actions'] = (
+            temporal_action_samples if has_temporal_actions else None)
+        far_negative_samples = [
+            sample.get('far_negative_pixel_values')
+            for _, sample in lava_samples
+        ]
+        has_far_negatives = all(
+            sample is not None for sample in far_negative_samples)
+        if any(sample is not None for sample in far_negative_samples) \
+                and not has_far_negatives:
+            raise ValueError(
+                "A LAVA batch cannot mix samples with and without far negatives")
+        result['far_negative_pixel_values'] = (
+            far_negative_samples if has_far_negatives else None)
+        far_action_samples = [
+            sample.get('far_negative_actions') for _, sample in lava_samples]
+        has_far_actions = all(sample is not None for sample in far_action_samples)
+        result['far_negative_actions'] = (
+            far_action_samples if has_far_actions else None)
         result['evolution_batch_indices'] = torch.tensor(
             [batch_idx for batch_idx, _ in lava_samples], dtype=torch.long)
         result['evolution_starts'] = torch.tensor(
             [sample['evolution_start'] for _, sample in lava_samples], dtype=torch.long)
         result['evolution_scales'] = torch.tensor(
             [sample['evolution_scale'] for _, sample in lava_samples], dtype=torch.long)
+        result['temporal_negative_distances'] = (
+            torch.tensor([
+                sample['temporal_negative_distance'] for _, sample in lava_samples
+            ], dtype=torch.long) if has_temporal_negatives else None)
+        result['temporal_negative_local_fallbacks'] = (
+            torch.tensor([
+                sample['temporal_negative_local_fallback']
+                for _, sample in lava_samples
+            ], dtype=torch.bool) if has_temporal_negatives else None)
+        result['far_negative_distances'] = (
+            torch.tensor([
+                sample['far_negative_distance'] for _, sample in lava_samples
+            ], dtype=torch.long) if has_far_negatives else None)
     else:
         result['evolution_pixel_values'] = None
         result['evolution_batch_indices'] = None
         result['evolution_starts'] = None
         result['evolution_scales'] = None
+        result['temporal_negative_pixel_values'] = None
+        result['far_negative_pixel_values'] = None
+        result['temporal_negative_actions'] = None
+        result['far_negative_actions'] = None
+        result['temporal_negative_distances'] = None
+        result['far_negative_distances'] = None
+        result['temporal_negative_local_fallbacks'] = None
 
     return result
