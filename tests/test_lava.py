@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
@@ -13,6 +14,7 @@ from dataloader.dataset import (
 from models.model_runner import VLAWrapper
 from models.vla_model_fm import (
     EMALogSignatureCalibrator,
+    EMAActionComponentCalibrator,
     EMAActionDistanceCalibrator,
     VLAModel,
     _raw_logsignature_levels,
@@ -40,18 +42,33 @@ class _ScaleEchoDataset(torch.utils.data.Dataset):
 def test_v5_gripper_aware_action_descriptor():
     normalized = torch.zeros(4, 14)
     raw_open = torch.zeros(4, 14)
+
+    # A constant joint-position offset is invisible to arm deltas but must be
+    # visible to the new arm-state component.
+    shifted_arm = normalized.clone()
+    shifted_arm[:, 0] = 1.0
+    arm_state, arm_change, grip_state, grip_change, combined = (
+        action_path_distance(
+            normalized, raw_open, shifted_arm, raw_open.clone()))
+    assert arm_state > 0
+    assert arm_change == 0
+    assert grip_state == 0
+    assert grip_change == 0
+    assert combined == 0.5 * arm_state
+
     raw_closed = raw_open.clone()
     raw_closed[:, [6, 13]] = 1.0
-    arm, state, change, combined = action_path_distance(
+    arm_state, arm_change, state, change, combined = action_path_distance(
         normalized, raw_open, normalized, raw_closed)
-    assert arm == 0
+    assert arm_state == 0
+    assert arm_change == 0
     assert state > 0
     assert change == 0
     assert combined == 0.5 * state
 
     raw_changing = raw_open.clone()
     raw_changing[:, [6, 13]] = torch.tensor([0.0, 0.0, 1.0, 1.0])[:, None]
-    _, _, change, _ = action_path_distance(
+    _, _, _, change, _ = action_path_distance(
         normalized, raw_open, normalized, raw_changing)
     assert change > 0
 
@@ -77,6 +94,36 @@ def test_v5_family_balanced_beta_initialization_ema_and_checkpoint():
     restored = EMAActionDistanceCalibrator(scales=(4,))
     restored.load_state_dict(calibrator.state_dict(), strict=True)
     assert torch.allclose(restored.beta(4), calibrator.beta(4))
+
+
+def test_v5_1_component_calibration_balances_scales_and_family_counts():
+    calibrator = EMAActionComponentCalibrator(scales=(4,), momentum=0.99)
+    # Cross has 100x more candidates and a wildly different raw scale, but
+    # every family contributes one median per component.
+    cross = torch.tensor([[1e-3, 2e-3, 2.0, 1e-2]]).repeat(100, 1)
+    local = torch.tensor([[2e-3, 4e-3, 1.0, 2e-2]])
+    far = torch.tensor([[3e-3, 6e-3, 3.0, 3e-2]])
+    first = calibrator.update(4, (cross, local, far))
+    assert torch.allclose(first, torch.tensor([2e-3, 4e-3, 2.0, 2e-2]))
+
+    larger_cross = torch.tensor(
+        [[4e-3, 8e-3, 5.0, 4e-2]]).repeat(10000, 1)
+    second = calibrator.update(4, (larger_cross, local, far))
+    expected_batch = torch.tensor([3e-3, 6e-3, 3.0, 3e-2])
+    assert torch.allclose(
+        second, first * 0.99 + expected_batch * 0.01, atol=1e-7)
+
+    restored = EMAActionComponentCalibrator(scales=(4,))
+    restored.load_state_dict(calibrator.state_dict(), strict=True)
+    assert torch.allclose(restored.beta(4), calibrator.beta(4))
+
+    # A zero-only component remains uninitialized and does not poison a later
+    # non-zero first observation with an epsilon-based EMA update.
+    zero_then_signal = EMAActionComponentCalibrator(scales=(4,))
+    zero_then_signal.update(4, (torch.zeros(3, 4),))
+    assert not zero_then_signal.ema_initialized.any()
+    signal = torch.tensor([[0.25, 0.5, 0.75, 1.0]])
+    assert torch.allclose(zero_then_signal.update(4, (signal,)), signal[0])
 
 
 def test_v5_weighted_count_balancing_uses_candidate_count_not_weight_sum():
@@ -133,7 +180,8 @@ def test_v5_batch_uniform_scale_sampler_multiworker_and_resume():
     assert actual == expected
 
 
-def _small_v5_model(weighting):
+def _small_v5_model(weighting, signature_normalization="ema_calibrated",
+                    component_calibration=False):
     return VLAModel(
         action_dim=14, proprio_dim=2, hidden_dim=32, num_heads=4, depth=1,
         action_len=8, proprio_len=1, num_registers=0,
@@ -142,8 +190,10 @@ def _small_v5_model(weighting):
         lava_residual_dim=4, lava_qformer_hidden_dim=16,
         lava_qformer_num_queries=1, lava_qformer_num_layers=1,
         lava_qformer_num_heads=4, lava_logsig_depth=2,
+        lava_signature_normalization=signature_normalization,
         lava_scales=(1, 2, 4, 8, 16),
         lava_action_similarity_weighting=weighting,
+        lava_action_component_calibration=component_calibration,
     )
 
 
@@ -152,8 +202,11 @@ def test_v5_conditional_state_dict_and_mixed_bf16_backward():
     assert not any("action_distance_calibrator" in key for key in v4.state_dict())
     v4.load_state_dict(v4.state_dict(), strict=True)
 
-    model = _small_v5_model(True)
+    model = _small_v5_model(
+        True, signature_normalization="per_level_unit",
+        component_calibration=True)
     assert any("action_distance_calibrator" in key for key in model.state_dict())
+    assert any("action_component_calibrator" in key for key in model.state_dict())
     action_hidden = torch.randn(4, 8, 32, requires_grad=True)
     normalized_actions = torch.rand(4, 8, 14) * 2 - 1
     raw_actions = (normalized_actions + 1) / 2
@@ -186,9 +239,22 @@ def test_v5_conditional_state_dict_and_mixed_bf16_backward():
             far_negative_raw_actions=far_raw,
         )
     assert torch.isfinite(loss)
+    assert diagnostics["arm_state_distance"] >= 0
+    assert diagnostics["arm_change_distance"] >= 0
     assert diagnostics["arm_action_distance"] >= 0
     assert diagnostics["gripper_state_distance"] >= 0
     assert diagnostics["gripper_change_distance"] >= 0
+    assert diagnostics["calibrated_arm_action_distance"] >= 0
+    assert diagnostics["calibrated_arm_state_action_distance"] >= 0
+    assert diagnostics["calibrated_arm_change_action_distance"] >= 0
+    assert math.isfinite(diagnostics["action_component_beta_arm_state_s2"])
+    assert math.isfinite(diagnostics["action_component_beta_arm_change_s2"])
+    contribution_sum = sum(
+        diagnostics[f"action_distance_{component}_contribution_fraction"]
+        for component in ("arm_state", "arm_change", "gripper_state",
+                          "gripper_change"))
+    assert math.isclose(contribution_sum, 1.0, abs_tol=1e-5)
+    assert diagnostics["lava_order_negative_count"] == 0
     assert 0.1 <= diagnostics["local_neg_weight_mean"] <= 1.0
     assert math.isfinite(diagnostics["action_distance_beta_s2"])
     assert diagnostics["raw_candidate_acc"] >= 0
@@ -199,11 +265,54 @@ def test_v5_conditional_state_dict_and_mixed_bf16_backward():
     assert model.lava_world_encoder.output_proj.weight.grad is not None
 from train import (
     LossLogger,
+    build_optimizer_and_scheduler,
     build_lava_gradient_parameter_groups,
     compute_lava_weight,
     compute_shared_gradient_diagnostics,
+    parameter_update_diagnostics,
+    snapshot_parameters,
     should_run_lava_grad_diagnostics,
 )
+
+
+def test_qformer_lr_scale_is_preserved_over_full_cosine_schedule():
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy = nn.Linear(3, 3)
+            self.lava_world_encoder = nn.Linear(3, 3)
+
+    model = TinyModel()
+    optimizer, scheduler, qformer_parameters, qformer_group_index = (
+        build_optimizer_and_scheduler(
+            model, lr=2e-4, lr_min=5e-5, betas=(0.9, 0.99),
+            weight_decay=0.01, total_steps=10, qformer_lr_scale=0.25))
+    assert qformer_group_index == 1
+    assert {id(parameter) for parameter in qformer_parameters} == {
+        id(parameter) for parameter in model.lava_world_encoder.parameters()
+    }
+    assert math.isclose(optimizer.param_groups[1]["lr"],
+                        0.25 * optimizer.param_groups[0]["lr"])
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+        assert math.isclose(
+            optimizer.param_groups[1]["lr"],
+            0.25 * optimizer.param_groups[0]["lr"], rel_tol=1e-12)
+    assert math.isclose(optimizer.param_groups[0]["lr"], 5e-5, rel_tol=1e-12)
+    assert math.isclose(optimizer.param_groups[1]["lr"], 1.25e-5, rel_tol=1e-12)
+
+
+def test_exact_parameter_update_diagnostics():
+    parameter = nn.Parameter(torch.tensor([3.0, 4.0]))
+    before = snapshot_parameters([parameter])
+    with torch.no_grad():
+        parameter.add_(torch.tensor([0.3, 0.4]))
+    result = parameter_update_diagnostics([parameter], before)
+    assert math.isclose(result["param_norm"], 5.0, rel_tol=1e-6)
+    assert math.isclose(result["update_norm"], 0.5, rel_tol=1e-6)
+    assert math.isclose(result["update_ratio"], 0.1, rel_tol=1e-6)
+    assert math.isclose(result["changed_element_fraction"], 1.0)
 
 
 def test_lava_weight_schedule_is_step_based_and_resume_safe():
@@ -366,6 +475,31 @@ def test_ema_calibration_preserves_weak_second_order_energy_and_checkpoints():
     assert torch.allclose(restored.ema_squared_norm, calibrator.ema_squared_norm)
 
 
+def test_per_level_unit_model_restores_legacy_equal_level_energy():
+    model = VLAModel(
+        action_dim=14, proprio_dim=2, hidden_dim=32, num_heads=4, depth=1,
+        action_len=8, proprio_len=1, num_registers=0,
+        dino_feat_dims=(16,), vlm_num_queries=2, adapter_depth=1,
+        use_future_feat=False, use_lava=True, lava_dino_feat_dim=16,
+        lava_residual_dim=4, lava_qformer_hidden_dim=16,
+        lava_qformer_num_layers=1, lava_qformer_num_heads=4,
+        lava_signature_normalization="per_level_unit",
+    )
+    assert model.lava_signature_calibrator is None
+    assert not any("signature_calibrator" in key for key in model.state_dict())
+
+    path = torch.tensor([
+        [1.0, 0.0, 0.25], [1.0, 0.001, 0.25],
+        [1.0, 0.002, 0.25], [1.0, 0.003, 0.25],
+    ])
+    signature = normalized_logsignature(path, depth=2)
+    split = path.shape[1]
+    assert torch.allclose(signature[:split].square().sum(),
+                          torch.tensor(0.5), atol=1e-5)
+    assert torch.allclose(signature[split:].square().sum(),
+                          torch.tensor(0.5), atol=1e-5)
+
+
 def test_raw_logsignature_norms_expose_tiny_second_order_level():
     near_straight = torch.tensor([
         [1.0, 0.0000, 0.25],
@@ -377,8 +511,8 @@ def test_raw_logsignature_norms_expose_tiny_second_order_level():
         near_straight, depth=2, return_raw_norms=True)
     ratio = raw_norms["level2_raw_norm"] / raw_norms["level1_raw_norm"]
     assert 0.0 < ratio < 0.01
-    # The legacy helper demonstrates why V4 no longer uses per-level,
-    # per-sample unit normalization inside the model.
+    # The legacy helper and restored per_level_unit mode intentionally give
+    # non-zero order structure equal representation energy.
     assert signature[near_straight.shape[1]:].norm() > 0.5
 
 
@@ -431,7 +565,8 @@ def test_episode_local_pair_is_same_scale_non_overlapping_and_radius_capped():
         assert 0 <= negative_start <= 283
 
 
-def test_mixed_pair_adds_far_negative_outside_local_radius():
+@pytest.mark.parametrize("negative_mode", ["mixed", "mixed_batch"])
+def test_mixed_pair_adds_far_negative_outside_local_radius(negative_mode):
     dataset = RobotWinTaskDataset.__new__(RobotWinTaskDataset)
     dataset.use_lava = True
     dataset.lava_sample_ratio = 1.0
@@ -439,7 +574,7 @@ def test_mixed_pair_adds_far_negative_outside_local_radius():
     dataset.lava_scale_sampling = "uniform"
     dataset.lava_scale_probs = None
     dataset.lava_sampling_balance = "none"
-    dataset.lava_negative_mode = "mixed"
+    dataset.lava_negative_mode = negative_mode
     dataset.lava_negative_window_multiplier = 4
     dataset.lava_negative_window_max = 32
     dataset.chunk_size = 32
@@ -589,7 +724,7 @@ def test_lava_loss_handles_scale_one_and_backpropagates():
         "lava_position_mean", "lava_position_min", "lava_position_max",
         "lava_executed_horizon_ratio",
     }.issubset(diagnostics)
-    assert diagnostics["lava_order_negative_count"] == 2
+    assert diagnostics["lava_order_negative_count"] == 1
     assert math.isfinite(diagnostics["same_task_negative_sim"])
     assert math.isfinite(diagnostics["cross_task_negative_sim"])
     assert math.isfinite(diagnostics["task_shortcut_gap"])
@@ -733,7 +868,7 @@ def test_mixed_negative_families_and_execution_diagnostics_backpropagate():
     )
     assert torch.isfinite(loss)
     assert diagnostics["cross_task_candidate_count"] == 1.0
-    assert math.isclose(diagnostics["order_candidate_count"], 1.5)
+    assert math.isclose(diagnostics["order_candidate_count"], 1.0)
     assert math.isclose(
         sum(diagnostics[key] for key in (
             "hardest_cross_task_fraction", "hardest_local_fraction",
@@ -750,6 +885,79 @@ def test_mixed_negative_families_and_execution_diagnostics_backpropagate():
     assert action_hidden.grad is not None
     assert model.lava_world_encoder.output_proj.weight.grad is not None
     assert model.lava_action_projector[-1].weight.grad is not None
+
+
+@pytest.mark.parametrize("sample_count", [1, 2, 4])
+def test_mixed_batch_identical_paths_have_individual_candidate_mass(sample_count):
+    # All candidates have the same score: CE must be log(N + 2), counting
+    # N-1 other batch paths plus local/far. A family average would give log(4)
+    # for every N>1; including self twice would instead give log(N + 3).
+    torch.manual_seed(51)
+    model = _small_v5_model(False, signature_normalization="per_level_unit").eval()
+    hidden = torch.randn(1, 8, 32).repeat(sample_count, 1, 1).requires_grad_()
+    path = torch.randn(1, 5, 16)
+    paths = [path.clone() for _ in range(sample_count)]
+    loss, diagnostics = model.compute_lava_loss(
+        action_hidden=hidden, world_feature_differences=paths,
+        temporal_negative_feature_differences=paths,
+        far_negative_feature_differences=paths,
+        negative_mode="mixed_batch", batch_indices=torch.arange(sample_count),
+        interval_starts=torch.zeros(sample_count, dtype=torch.long),
+        interval_scales=torch.ones(sample_count, dtype=torch.long),
+        task_names=["same_task"] * sample_count,
+    )
+    assert loss.item() == pytest.approx(math.log(sample_count + 2), abs=1e-5)
+    assert diagnostics["batch_candidate_count"] == sample_count - 1
+    assert diagnostics["same_task_batch_candidate_count"] == sample_count - 1
+    assert diagnostics["negative_candidate_count"] == sample_count + 1
+    assert diagnostics["lava_order_negative_count"] == 0
+    assert "_action_similarity_audit" not in diagnostics
+    loss.backward()
+    assert torch.isfinite(hidden.grad).all()
+
+
+def test_mixed_batch_masks_scales_ignores_task_labels_and_backpropagates_bf16():
+    torch.manual_seed(52)
+    model = _small_v5_model(False, signature_normalization="per_level_unit").eval()
+    hidden = torch.randn(4, 8, 32, requires_grad=True)
+    scales = [2, 2, 4, 4]
+    inputs = dict(
+        action_hidden=hidden,
+        world_feature_differences=[torch.randn(s, 5, 16) for s in scales],
+        temporal_negative_feature_differences=[torch.randn(s, 5, 16) for s in scales],
+        far_negative_feature_differences=[torch.randn(s, 5, 16) for s in scales],
+        negative_mode="mixed_batch", batch_indices=torch.arange(4),
+        interval_starts=torch.zeros(4, dtype=torch.long),
+        interval_scales=torch.tensor(scales), order_negative=True,
+    )
+    losses = []
+    for tasks in (["a"] * 4, ["a", "b", "c", "d"], None):
+        torch.manual_seed(53)
+        with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+            loss, diagnostics = model.compute_lava_loss(**inputs, task_names=tasks)
+        losses.append(loss)
+        assert diagnostics["batch_candidate_count"] == 1
+        assert diagnostics["negative_candidate_count"] == 3.5
+        assert diagnostics["order_candidate_count"] == 1
+        assert diagnostics["lava_order_negative_count"] == 2
+        assert sum(diagnostics[f"hardest_{name}_fraction"] for name in
+                   ("batch", "local", "far", "order")) == pytest.approx(1)
+    torch.testing.assert_close(losses[0], losses[1])
+    torch.testing.assert_close(losses[0], losses[2])
+    losses[0].backward()
+    for grad in (hidden.grad, model.lava_world_encoder.output_proj.weight.grad,
+                 model.lava_action_projector[-1].weight.grad):
+        assert grad is not None and torch.isfinite(grad).all()
+
+
+def test_mixed_batch_rejects_action_weighting():
+    model = _small_v5_model(True)
+    with pytest.raises(ValueError, match="weighting disabled"):
+        model.compute_lava_loss(
+            action_hidden=torch.zeros(0, 8, 32), world_feature_differences=[],
+            batch_indices=torch.empty(0, dtype=torch.long),
+            interval_starts=torch.empty(0, dtype=torch.long),
+            interval_scales=torch.empty(0, dtype=torch.long), negative_mode="mixed_batch")
 
 
 def test_shared_gradient_diagnostics_are_correct_and_do_not_write_grads():
@@ -933,3 +1141,163 @@ def test_layer_gradient_groups_match_twelve_block_architecture():
     assert all(groups[name] for name in ("input", "b1_4", "b5_8", "b9_10", "b11_12"))
     block11_ids = {id(parameter) for parameter in model.blocks[10].parameters()}
     assert block11_ids.issubset({id(parameter) for parameter in groups["b11_12"]})
+
+
+def _small_v6_model():
+    return VLAModel(
+        action_dim=14, proprio_dim=2, hidden_dim=32, num_heads=4, depth=1,
+        action_len=17, proprio_len=1, num_registers=0,
+        dino_feat_dims=(16,), vlm_num_queries=2, adapter_depth=1,
+        use_future_feat=False, use_lava=True, lava_dino_feat_dim=16,
+        lava_world_encoding="state_delta", lava_time_channel=False,
+        lava_residual_dim=128, lava_query_dim=16,
+        lava_qformer_hidden_dim=32, lava_qformer_num_queries=8,
+        lava_qformer_num_layers=2, lava_qformer_num_heads=4,
+        lava_signature_normalization="per_level_unit")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_v6_state_queries_and_telescoping(dtype):
+    torch.manual_seed(61)
+    model = _small_v6_model().to(dtype=dtype).train()
+    encoder = model.lava_world_encoder
+    assert encoder.output_proj.weight.shape == (16, 32)
+    features = torch.randn(17, 5, 16).to(dtype)
+    # Include identical adjacent states and a closed loop.
+    features[4] = features[3]
+    features[-1] = features[0]
+    states = encoder(features)
+    assert states.shape == (17, 128) and states.dtype == torch.float32
+    increments = states[1:] - states[:-1]
+    torch.testing.assert_close(increments[3], torch.zeros(128), atol=1e-6, rtol=0)
+    for length in (1, 2, 4, 8, 16):
+        torch.testing.assert_close(increments[:length].sum(0), states[length] - states[0], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(increments.sum(0), torch.zeros(128), atol=1e-6, rtol=0)
+    reversed_states = encoder(features.flip(0))
+    torch.testing.assert_close(reversed_states[1:] - reversed_states[:-1], -increments.flip(0), atol=2e-6, rtol=1e-5)
+    increments.square().sum().backward()
+    for name in ('query_embed', 'input_proj.weight', 'output_proj.weight'):
+        grad = dict(encoder.named_parameters())[name].grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.norm() > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_v6_mixed_paths_no_time_and_backward(dtype, monkeypatch):
+    import models.vla_model_fm as module
+    torch.manual_seed(62)
+    model = _small_v6_model().to(dtype=dtype)
+    # Two samples per scale exercise same-scale and same-task batch negatives.
+    scales = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16]
+    groups = [[torch.randn(length + 1, 5, 16) for length in scales] for _ in range(3)]
+    hidden = torch.randn(10, 17, 32, dtype=dtype, requires_grad=True)
+    observed = []
+    original = module._raw_logsignature_levels
+    def capture(increments):
+        assert increments.shape[1] == 128
+        levels = original(increments)
+        assert all(level.dtype == torch.float32 for level in levels)
+        assert sum(level.numel() for level in levels) == 8256
+        observed.append(increments.shape[0])
+        return levels
+    monkeypatch.setattr(module, '_raw_logsignature_levels', capture)
+    with torch.autocast('cpu', dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+        loss, diagnostics = model.compute_lava_loss(
+            hidden, None, torch.arange(10), torch.zeros(10, dtype=torch.long),
+            torch.tensor(scales), world_feature_paths=groups[0],
+            temporal_negative_feature_paths=groups[1], far_negative_feature_paths=groups[2],
+            negative_mode='mixed_batch', task_names=['same'] * 10)
+    assert torch.isfinite(loss)
+    # Positive action/world + paired local/far + two order corruptions at L>=4.
+    assert len(observed) == 4 * 10 + 2 * 6
+    assert diagnostics['batch_candidate_count'] == 1
+    assert diagnostics['same_task_batch_candidate_count'] == 1
+    assert diagnostics['lava_order_negative_count'] == 6
+    assert diagnostics['state_endpoint_error'] < 1e-6
+    assert 0 <= diagnostics['order_equivalent_fraction'] <= 1
+    loss.backward()
+    assert torch.isfinite(hidden.grad).all()
+    assert hidden.grad[:, 0].count_nonzero() == 0
+    for branch in (model.lava_world_encoder, model.lava_action_projector):
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in branch.parameters())
+        assert sum(p.grad.float().norm() for p in branch.parameters()) > 0
+    with pytest.raises(ValueError, match='full frame'):
+        model.compute_lava_loss(hidden, [p[1:] - p[:-1] for p in groups[0]],
+                                torch.arange(10), torch.zeros(10), torch.tensor(scales))
+
+
+def test_v6_frozen_frame_extraction_preserves_path_boundaries():
+    from types import SimpleNamespace
+    class Vision(nn.Module):
+        def forward(self, pixel_values, **kwargs):
+            assert not torch.is_grad_enabled()
+            return SimpleNamespace(hidden_states=[pixel_values])
+    wrapper = VLAWrapper.__new__(VLAWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.device = 'cpu'
+    wrapper.dtype = torch.float32
+    wrapper.vision_encode_batch_size = 3
+    wrapper.lava_target_layer = 0
+    wrapper.num_register_tokens = 1
+    wrapper.vision_encoder = Vision()
+    images = [torch.randn(n, 7, 16, requires_grad=True) for n in (2, 5, 17)]
+    paths = wrapper.get_evolution_feature_paths(images)
+    differences = wrapper.get_evolution_feature_differences(images)
+    for image, path, difference in zip(images, paths, differences):
+        assert not path.requires_grad
+        torch.testing.assert_close(path, image[:, 2:])
+        torch.testing.assert_close(difference, path[1:] - path[:-1])
+
+
+def test_time_free_collinear_order_can_be_equivalent():
+    direction = torch.randn(128)
+    path = torch.tensor([1., 2., 3., 4.])[:, None] * direction
+    # FP64 construction isn't required; a coordinate-axis path is exactly collinear.
+    path.zero_()
+    path[:, 0] = torch.tensor([1., 2., 3., 4.])
+    torch.testing.assert_close(normalized_logsignature(path), normalized_logsignature(path.flip(0)))
+
+
+def test_v6_flow_matching_routes_full_paths():
+    from models.vla_model_fm import calc_flow_matching_loss
+    model = _small_v6_model()
+    paths = [torch.randn(5, 5, 16) for _ in range(2)]
+    loss, info = calc_flow_matching_loss(
+        model, x1=torch.randn(2, 17, 14),
+        dino_features_list=[torch.randn(2, 5, 16)],
+        qpos_history=torch.randn(2, 1, 2), use_lava=True, lambda_lava=0.01,
+        world_feature_paths=paths,
+        temporal_negative_feature_paths=[p + torch.randn_like(p) for p in paths],
+        far_negative_feature_paths=[torch.randn_like(p) for p in paths],
+        lava_batch_indices=torch.arange(2), lava_interval_starts=torch.zeros(2, dtype=torch.long),
+        lava_interval_scales=torch.full((2,), 4), lava_negative_mode='mixed_batch',
+        task_names=['a', 'a'])
+    assert info['lava_sample_count'] == 2
+    assert info['state_endpoint_error'] < 1e-6
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.lava_world_encoder.query_embed.grad.norm() > 0
+
+
+def test_v6_config_factory_and_legacy_defaults():
+    from omegaconf import OmegaConf
+    from models.model_runner import ModelFactory
+    config = OmegaConf.load(Path(__file__).parents[1] / 'configs/robotwin_all.yaml')
+    config.model.action_expert.hidden_size = 32
+    config.model.action_expert.depth = 1
+    config.model.action_expert.num_heads = 4
+    config.model.future_feat.enabled = False
+    model = ModelFactory.create_action_model(config, 16, 1)
+    assert model.lava_world_encoding == 'state_delta'
+    assert model.lava_world_encoder.query_embed.shape == (1, 8, 256)
+    assert model.lava_world_encoder.output_proj.weight.shape == (16, 256)
+    assert model.lava_action_projector[-1].out_features == 128
+    assert not model.lava_time_channel
+    for key in ('world_encoding', 'time_channel'):
+        del config.model.lava[key]
+    del config.model.lava.qformer['query_dim']
+    config.model.lava.qformer.num_queries = 1
+    config.model.lava.residual_dim = 32
+    legacy = ModelFactory.create_action_model(config, 16, 1)
+    assert legacy.lava_world_encoding == 'feature_delta' and legacy.lava_time_channel
+    assert legacy.lava_world_encoder.output_proj.weight.shape == (32, 256)
+    legacy.load_state_dict(legacy.state_dict(), strict=True)

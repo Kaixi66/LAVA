@@ -91,12 +91,19 @@ class ModelFactory:
         qformer_cfg = lava_cfg.get('qformer', {}) if lava_cfg else {}
         signature_norm_cfg = lava_cfg.get('signature_normalization', {}) \
             if lava_cfg else {}
+        signature_norm_type = (
+            signature_norm_cfg.get('type', 'per_level_unit')
+            if signature_norm_cfg else 'per_level_unit')
         if use_lava:
             logger.info(
                 f"LAVA ENABLED: target_layer={lava_cfg.get('dino_target_layer', -4)}, "
                 f"action_target_layer={lava_cfg.get('action_target_layer', 'final')}, "
+                f"world_encoding={lava_cfg.get('world_encoding', 'feature_delta')}, "
+                f"queries={qformer_cfg.get('num_queries', 1)}, "
+                f"time_channel={lava_cfg.get('time_channel', True)}, "
                 f"residual_dim={lava_cfg.get('residual_dim', 32)}, "
-                f"logsig_depth={lava_cfg.get('logsig_depth', 2)}")
+                f"logsig_depth={lava_cfg.get('logsig_depth', 2)}, "
+                f"signature_normalization={signature_norm_type}")
 
         # Future-frame patch token count (number of queries for dense prediction); image_size=(W,H)
         img_w, img_h = tuple(config.dataset.image_size)
@@ -132,6 +139,9 @@ class ModelFactory:
             future_feat_heads=future_feat_heads,
             use_lava=use_lava,
             lava_dino_feat_dim=dino_hidden_size,
+            lava_world_encoding=lava_cfg.get('world_encoding', 'feature_delta'),
+            lava_time_channel=lava_cfg.get('time_channel', True),
+            lava_query_dim=qformer_cfg.get('query_dim', 16),
             lava_residual_dim=lava_cfg.get('residual_dim', 32) if lava_cfg else 32,
             lava_qformer_hidden_dim=qformer_cfg.get('hidden_dim', 256) if qformer_cfg else 256,
             lava_qformer_num_queries=qformer_cfg.get('num_queries', 1) if qformer_cfg else 1,
@@ -139,6 +149,7 @@ class ModelFactory:
             lava_qformer_num_heads=qformer_cfg.get('num_heads', 4) if qformer_cfg else 4,
             lava_logsig_depth=lava_cfg.get('logsig_depth', 2) if lava_cfg else 2,
             lava_action_target_layer=lava_cfg.get('action_target_layer', 'final') if lava_cfg else 'final',
+            lava_signature_normalization=signature_norm_type,
             lava_scales=tuple(config.training.get(
                 'lava_scales', [1, 2, 4, 8, 16])),
             lava_signature_ema_momentum=signature_norm_cfg.get(
@@ -147,6 +158,8 @@ class ModelFactory:
                 'level2_weight', 0.5) if signature_norm_cfg else 0.5,
             lava_action_similarity_weighting=bool(config.training.get(
                 'lava_action_similarity_weighting', False)),
+            lava_action_component_calibration=bool(config.training.get(
+                'lava_action_component_calibration', False)),
             lava_action_similarity_min_weight=float(config.training.get(
                 'lava_action_similarity_min_weight', 0.1)),
             lava_action_similarity_beta_momentum=float(config.training.get(
@@ -155,6 +168,10 @@ class ModelFactory:
                 'lava_action_similarity_beta_multiplier', 1.0)),
             lava_action_gripper_indices=tuple(config.training.get(
                 'lava_action_gripper_indices', [6, 13])),
+            lava_action_arm_state_weight=float(config.training.get(
+                'lava_action_arm_state_weight', 0.5)),
+            lava_action_arm_change_weight=float(config.training.get(
+                'lava_action_arm_change_weight', 0.5)),
             lava_action_gripper_state_weight=float(config.training.get(
                 'lava_action_gripper_state_weight', 0.5)),
             lava_action_gripper_change_weight=float(config.training.get(
@@ -218,10 +235,10 @@ class VLAWrapper(nn.Module):
             self.lava_negative_mode = train_config.get('lava_negative_mode', 'batch')
             self.lava_action_similarity_weighting = bool(
                 train_config.get('lava_action_similarity_weighting', False))
-            if self.lava_negative_mode not in {'batch', 'episode_local', 'mixed'}:
+            if self.lava_negative_mode not in {'batch', 'episode_local', 'mixed', 'mixed_batch'}:
                 raise ValueError(
-                    "lava_negative_mode must be 'batch', 'episode_local', or "
-                    "'mixed', got "
+                    "lava_negative_mode must be 'batch', 'episode_local', "
+                    "'mixed', or 'mixed_batch', got "
                     f"{self.lava_negative_mode}")
             self.action_execution_horizon = int(
                 train_config.get('action_execution_horizon', 16))
@@ -358,13 +375,13 @@ class VLAWrapper(nn.Module):
         return h
 
     @torch.no_grad()
-    def get_evolution_feature_differences(self, evolution_pixel_values):
-        """Encode variable-length frame paths and return raw DINO patch deltas.
+    def get_evolution_feature_paths(self, evolution_pixel_values):
+        """Encode variable-length frame paths and return frozen per-frame DINO features.
 
         Args:
             evolution_pixel_values: list[(L+1, 3, H, W)]
         Returns:
-            list[(L, num_patches, dino_hidden_size)] in the original sample order
+            list[(L+1, num_patches, dino_hidden_size)] in the original sample order
         """
         if not evolution_pixel_values:
             return []
@@ -383,6 +400,11 @@ class VLAWrapper(nn.Module):
             feature_chunks.append(features)
         flat_features = torch.cat(feature_chunks, dim=0)
         paths = flat_features.split(frame_counts, dim=0)
+        return list(paths)
+
+    @torch.no_grad()
+    def get_evolution_feature_differences(self, evolution_pixel_values):
+        paths = self.get_evolution_feature_paths(evolution_pixel_values)
         return [path[1:] - path[:-1] for path in paths]
 
     def _normalize_tensor(self, x, min_val, max_val):
@@ -442,9 +464,12 @@ class VLAWrapper(nn.Module):
 
         # 4c. Multi-scale world evolution targets. DINO stays frozen/no-grad;
         # gradients start at the trainable World Residual Q-Former.
-        world_feature_differences = None
-        temporal_negative_feature_differences = None
-        far_negative_feature_differences = None
+        state_mode = getattr(self.action_model, 'lava_world_encoding', 'feature_delta') == 'state_delta'
+        extract_features = (self.get_evolution_feature_paths if state_mode
+                            else self.get_evolution_feature_differences)
+        world_features = None
+        local_features = None
+        far_features = None
         temporal_negative_actions_raw = None
         temporal_negative_actions_normalized = None
         far_negative_actions_raw = None
@@ -453,12 +478,12 @@ class VLAWrapper(nn.Module):
             positive_paths = batch['evolution_pixel_values']
             temporal_negative_paths = batch.get('temporal_negative_pixel_values')
             far_negative_paths = batch.get('far_negative_pixel_values')
-            if self.lava_negative_mode in {'episode_local', 'mixed'}:
+            if self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
                 if temporal_negative_paths is None:
                     raise ValueError(
                         f"{self.lava_negative_mode} LAVA requires one local-negative path "
                         "for every positive path")
-                if self.lava_negative_mode == 'mixed' and far_negative_paths is None:
+                if self.lava_negative_mode in {'mixed', 'mixed_batch'} and far_negative_paths is None:
                     raise ValueError(
                         "mixed LAVA requires one far-negative path for every positive path")
                 if self.lava_action_similarity_weighting:
@@ -480,39 +505,39 @@ class VLAWrapper(nn.Module):
                 all_paths = positive_paths + temporal_negative_paths
                 if far_negative_paths is not None:
                     all_paths += far_negative_paths
-                all_differences = self.get_evolution_feature_differences(
+                all_features = extract_features(
                     all_paths)
                 positive_count = len(positive_paths)
-                world_feature_differences = all_differences[:positive_count]
-                temporal_negative_feature_differences = all_differences[
+                world_features = all_features[:positive_count]
+                local_features = all_features[
                     positive_count:2 * positive_count]
                 if far_negative_paths is not None:
-                    far_negative_feature_differences = all_differences[
+                    far_features = all_features[
                         2 * positive_count:]
             else:
                 if temporal_negative_paths is not None or far_negative_paths is not None:
                     raise ValueError(
                         "batch LAVA mode received unexpected paired-negative paths")
-                world_feature_differences = self.get_evolution_feature_differences(
+                world_features = extract_features(
                     positive_paths)
             for differences, scale in zip(
-                    world_feature_differences, batch['evolution_scales'].tolist()):
-                if differences.shape[0] != scale:
+                    world_features, batch['evolution_scales'].tolist()):
+                if differences.shape[0] != scale + int(state_mode):
                     raise ValueError(
                         f"LAVA path has {differences.shape[0]} transitions but scale={scale}")
-            if temporal_negative_feature_differences is not None:
+            if local_features is not None:
                 for differences, scale in zip(
-                        temporal_negative_feature_differences,
+                        local_features,
                         batch['evolution_scales'].tolist()):
-                    if differences.shape[0] != scale:
+                    if differences.shape[0] != scale + int(state_mode):
                         raise ValueError(
                             "LAVA temporal-negative path has "
                             f"{differences.shape[0]} transitions but scale={scale}")
-            if far_negative_feature_differences is not None:
+            if far_features is not None:
                 for differences, scale in zip(
-                        far_negative_feature_differences,
+                        far_features,
                         batch['evolution_scales'].tolist()):
-                    if differences.shape[0] != scale:
+                    if differences.shape[0] != scale + int(state_mode):
                         raise ValueError(
                             "LAVA far-negative path has "
                             f"{differences.shape[0]} transitions but scale={scale}")
@@ -536,10 +561,12 @@ class VLAWrapper(nn.Module):
             future_feat_target=future_feat_target,
             use_future_feat=self.use_future_feat,
             lambda_future_feat=self.lambda_future_feat,
-            world_feature_differences=world_feature_differences,
-            temporal_negative_feature_differences=(
-                temporal_negative_feature_differences),
-            far_negative_feature_differences=far_negative_feature_differences,
+            world_feature_differences=None if state_mode else world_features,
+            temporal_negative_feature_differences=None if state_mode else local_features,
+            far_negative_feature_differences=None if state_mode else far_features,
+            world_feature_paths=world_features if state_mode else None,
+            temporal_negative_feature_paths=local_features if state_mode else None,
+            far_negative_feature_paths=far_features if state_mode else None,
             lava_batch_indices=batch.get('evolution_batch_indices'),
             lava_interval_starts=batch.get('evolution_starts'),
             lava_interval_scales=batch.get('evolution_scales'),
@@ -559,7 +586,7 @@ class VLAWrapper(nn.Module):
             far_negative_raw_actions=far_negative_actions_raw,
         )
 
-        if self.use_lava and self.lava_negative_mode in {'episode_local', 'mixed'}:
+        if self.use_lava and self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
             distances = batch.get('temporal_negative_distances')
             scales = batch.get('evolution_scales')
             fallbacks = batch.get('temporal_negative_local_fallbacks')

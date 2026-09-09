@@ -414,17 +414,22 @@ def eval_policy(task_name,
 
         TASK_ENV.set_instruction(instruction=instruction)
 
+        episode_index = int(TASK_ENV.test_num)
+        episode_video_path = None
         if TASK_ENV.eval_video_path is not None:
+            episode_video_path = (
+                Path(TASK_ENV.eval_video_path) / f"episode{episode_index}.mp4")
+            ffmpeg_executable = os.environ.get("EVAL_FFMPEG_BIN", "ffmpeg")
             ffmpeg = subprocess.Popen(
                 [
-                    "ffmpeg", "-y", "-loglevel", "error",
+                    ffmpeg_executable, "-y", "-loglevel", "error",
                     "-f", "rawvideo", "-pixel_format", "rgb24",
                     "-video_size", video_size,
                     "-framerate", "10",
                     "-i", "-",
                     "-pix_fmt", "yuv420p",
                     "-vcodec", "libx264", "-crf", "23",
-                    f"{TASK_ENV.eval_video_path}/episode{TASK_ENV.test_num}.mp4",
+                    str(episode_video_path),
                 ],
                 stdin=subprocess.PIPE,
             )
@@ -440,15 +445,38 @@ def eval_policy(task_name,
 
             current_action = model.step(observation, instruction)
             TASK_ENV.take_action(current_action, action_type='qpos')
+            step_counter += 1
 
             if TASK_ENV.eval_success:
                 succ = True
                 break
 
-            step_counter += 1
-
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
+
+        final_video_path = None
+        if episode_video_path is not None and episode_video_path.exists():
+            outcome = "success" if succ else "failure"
+            final_video_path = episode_video_path.with_name(
+                f"episode{episode_index:03d}_seed{now_seed}_{outcome}.mp4")
+            os.replace(episode_video_path, final_video_path)
+
+        case_record = {
+            "task_name": str(task_name),
+            "task_config": str(args["task_config"]),
+            "checkpoint_setting": str(args["ckpt_setting"]),
+            "episode_index": episode_index,
+            "seed": int(now_seed),
+            "instruction": str(instruction),
+            "success": bool(succ),
+            "executed_steps": int(step_counter),
+            "video_path": str(final_video_path) if final_video_path else None,
+        }
+        case_record_path = Path(args["save_dir"]) / "episode_records.jsonl"
+        with open(case_record_path, "a", encoding="utf-8") as record_stream:
+            json.dump(case_record, record_stream, ensure_ascii=False)
+            record_stream.write("\n")
+            record_stream.flush()
 
         if succ:
             TASK_ENV.suc += 1

@@ -280,7 +280,7 @@ def encode_probe_paths(probe: LayerProbe, action_hidden: torch.Tensor,
         action_path = probe.action_projector(hidden_path)
         action_signatures.append(add_time_and_signature(action_path))
         world_signatures.append(add_time_and_signature(world_path))
-        if order_negative and scale >= 2:
+        if order_negative and scale >= 4:
             permutation = (order_permutations[row] if order_permutations is not None
                            else sample_full_shuffle_permutation(scale, device=device))
             if permutation is None:

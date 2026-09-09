@@ -1,3 +1,4 @@
+from utils.lava_health import LAVAHealthMonitor
 import os
 import sys
 import json
@@ -13,7 +14,7 @@ from datetime import datetime
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 
 from dataloader.dataset import (
     LAVABatchScaleBatchSampler, collate_fn, create_dataset)
@@ -83,12 +84,49 @@ class LossLogger:
         ("Hardest_Far_Fraction", "hardest_far_fraction", ".6f"),
         ("Hardest_Order_Fraction", "hardest_order_fraction", ".6f"),
         ("Cross_Task_Candidate_Count", "cross_task_candidate_count", ".4f"),
+        ("Batch_Candidate_Count", "batch_candidate_count", ".4f"),
+        ("Same_Task_Batch_Candidate_Count", "same_task_batch_candidate_count", ".4f"),
+        ("Negative_Candidate_Count", "negative_candidate_count", ".4f"),
+        ("Batch_Margin", "batch_margin", ".6f"),
+        ("Batch_Acc", "batch_acc", ".6f"),
+        ("Hardest_Batch_Fraction", "hardest_batch_fraction", ".6f"),
+        ("Hardest_Same_Task_Fraction", "hardest_same_task_fraction", ".6f"),
+        ("State_Endpoint_Error", "state_endpoint_error", ".8f"),
+        ("Order_Signature_Distance", "order_signature_distance", ".6f"),
+        ("Order_Equivalent_Fraction", "order_equivalent_fraction", ".4f"),
         ("Order_Candidate_Count", "order_candidate_count", ".4f"),
         # V5 detached action-similarity weighting
+        ("Arm_State_Distance", "arm_state_distance", ".6f"),
+        ("Arm_Change_Distance", "arm_change_distance", ".6f"),
+        # Compatibility alias: the old Arm_Action metric meant arm change.
         ("Arm_Action_Distance", "arm_action_distance", ".6f"),
         ("Gripper_State_Distance", "gripper_state_distance", ".6f"),
         ("Gripper_Change_Distance", "gripper_change_distance", ".6f"),
+        ("Raw_Combined_Action_Distance", "raw_combined_action_distance", ".6f"),
         ("Combined_Action_Distance", "combined_action_distance", ".6f"),
+        ("Calibrated_Arm_Action_Distance",
+         "calibrated_arm_action_distance", ".6f"),
+        ("Calibrated_Arm_State_Distance",
+         "calibrated_arm_state_action_distance", ".6f"),
+        ("Calibrated_Arm_Change_Distance",
+         "calibrated_arm_change_action_distance", ".6f"),
+        ("Calibrated_Gripper_State_Distance",
+         "calibrated_gripper_state_action_distance", ".6f"),
+        ("Calibrated_Gripper_Change_Distance",
+         "calibrated_gripper_change_action_distance", ".6f"),
+        *((f"Action_Component_Beta_{component}_S{scale}",
+           f"action_component_beta_{key}_s{scale}", ".6f")
+          for component, key in (("ArmState", "arm_state"),
+                                 ("ArmChange", "arm_change"),
+                                 ("GripperState", "gripper_state"),
+                                 ("GripperChange", "gripper_change"))
+          for scale in (1, 2, 4, 8, 16)),
+        *((f"Action_Distance_{component}_Contribution_Fraction",
+           f"action_distance_{key}_contribution_fraction", ".6f")
+          for component, key in (("ArmState", "arm_state"),
+                                 ("ArmChange", "arm_change"),
+                                 ("GripperState", "gripper_state"),
+                                 ("GripperChange", "gripper_change"))),
         *((f"Action_Distance_{family}_Median_S{scale}",
            f"action_distance_{family.lower()}_median_s{scale}", ".6f")
           for family in ("Cross", "Local", "Far")
@@ -238,8 +276,25 @@ class LossLogger:
         *((f"Scale_{scale}_Count", f"lava_scale_{scale}_count", "d")
           for scale in (1, 2, 4, 8, 16)),
         ("LR", "learning_rate", ".8e"),
+        ("QFormer_LR", "qformer_learning_rate", ".8e"),
         ("Grad_Norm", "grad_norm", ".6f"),
         ("Grad_Norm_LAVA_Branch", "lava_branch_grad_norm", ".6f"),
+        ("QFormer_Grad_Norm", "qformer_grad_norm", ".6f"),
+        ("Action_Projector_Grad_Norm", "action_projector_grad_norm", ".6f"),
+        ("QFormer_ActionProjector_Grad_Ratio",
+         "qformer_action_projector_grad_ratio", ".6f"),
+        ("QFormer_Param_Norm", "qformer_param_norm", ".6f"),
+        ("QFormer_Update_Norm", "qformer_update_norm", ".6f"),
+        ("QFormer_Update_Ratio", "qformer_update_ratio", ".8e"),
+        ("QFormer_Changed_Element_Fraction",
+         "qformer_changed_element_fraction", ".6f"),
+        ("Action_Projector_Param_Norm", "action_projector_param_norm", ".6f"),
+        ("Action_Projector_Update_Norm", "action_projector_update_norm", ".6f"),
+        ("Action_Projector_Update_Ratio", "action_projector_update_ratio", ".8e"),
+        ("Action_Projector_Changed_Element_Fraction",
+         "action_projector_changed_element_fraction", ".6f"),
+        ("QFormer_ActionProjector_Update_Ratio",
+         "qformer_action_projector_update_ratio", ".6f"),
         ("Grad_Cos_Shared", "grad_cos_shared", ".6f"),
         ("Grad_Norm_Base_Shared", "grad_norm_base_shared", ".6f"),
         ("Grad_Norm_LAVA_Shared", "grad_norm_lava_shared", ".6f"),
@@ -267,6 +322,10 @@ class LossLogger:
     )
 
     NAN_DEFAULT_KEYS = {
+        "state_endpoint_error", "order_signature_distance", "order_equivalent_fraction",
+        "batch_candidate_count", "same_task_batch_candidate_count",
+        "negative_candidate_count", "batch_margin", "batch_acc",
+        "hardest_batch_fraction", "hardest_same_task_fraction",
         "same_task_negative_sim", "cross_task_negative_sim", "task_shortcut_gap",
         "temporal_negative_sim", "temporal_margin", "temporal_acc",
         "order_acc", "candidate_acc", "positive_temporal_world_sim",
@@ -283,8 +342,18 @@ class LossLogger:
         "pos_sim_tail", "candidate_acc_executed", "candidate_acc_tail",
         "local_margin_executed", "local_margin_tail",
         "order_margin_executed", "order_margin_tail",
-        "arm_action_distance", "gripper_state_distance",
-        "gripper_change_distance", "combined_action_distance",
+        "arm_state_distance", "arm_change_distance", "arm_action_distance",
+        "gripper_state_distance",
+        "gripper_change_distance", "raw_combined_action_distance",
+        "combined_action_distance", "calibrated_arm_action_distance",
+        "calibrated_arm_state_action_distance",
+        "calibrated_arm_change_action_distance",
+        "calibrated_gripper_state_action_distance",
+        "calibrated_gripper_change_action_distance",
+        "action_distance_arm_state_contribution_fraction",
+        "action_distance_arm_change_contribution_fraction",
+        "action_distance_gripper_state_contribution_fraction",
+        "action_distance_gripper_change_contribution_fraction",
         "cross_task_neg_weight_mean", "local_neg_weight_mean",
         "far_neg_weight_mean", "cross_task_neg_weight_below_0_5",
         "local_neg_weight_below_0_5", "far_neg_weight_below_0_5",
@@ -293,6 +362,10 @@ class LossLogger:
           for family in ("cross", "local", "far") for scale in (1, 2, 4, 8, 16)),
         *(f"action_distance_aggregate_s{scale}" for scale in (1, 2, 4, 8, 16)),
         *(f"action_distance_beta_s{scale}" for scale in (1, 2, 4, 8, 16)),
+        *(f"action_component_beta_{component}_s{scale}"
+          for component in ("arm_state", "arm_change", "gripper_state",
+                            "gripper_change")
+          for scale in (1, 2, 4, 8, 16)),
         *(f"{kind}_{family}_{metric}"
           for kind in ("raw", "weighted")
           for family in ("cross_task", "local", "far") for metric in ("margin", "acc")),
@@ -302,6 +375,14 @@ class LossLogger:
         "raw_input_norm_norm_corr", "raw_world_residual_norm_corr",
         "grad_cos_shared", "grad_norm_base_shared", "grad_norm_lava_shared",
         "weighted_grad_ratio",
+        "qformer_grad_norm", "action_projector_grad_norm",
+        "qformer_action_projector_grad_ratio", "qformer_param_norm",
+        "qformer_update_norm", "qformer_update_ratio",
+        "qformer_changed_element_fraction",
+        "action_projector_param_norm", "action_projector_update_norm",
+        "action_projector_update_ratio",
+        "action_projector_changed_element_fraction",
+        "qformer_action_projector_update_ratio",
         *(f"grad_cos_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
         *(f"grad_norm_base_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
         *(f"grad_norm_lava_{key}" for key in ("input", "b1_4", "b5_8", "b9_10", "b11_12")),
@@ -359,6 +440,8 @@ def build_train_config_from_yaml(cfg):
         'lava_negative_mode': t.get('lava_negative_mode', 'batch'),
         'lava_action_similarity_weighting': t.get(
             'lava_action_similarity_weighting', False),
+        'lava_action_component_calibration': t.get(
+            'lava_action_component_calibration', False),
         'action_execution_horizon': cfg.common.get('action_execution_horizon', 16),
     }
 
@@ -372,6 +455,114 @@ def parameter_grad_norm(parameters):
     if not squared_norms:
         return 0.0
     return torch.stack(squared_norms).sum().sqrt().item()
+
+
+def snapshot_parameters(parameters):
+    """Take a detached snapshot only at sparse optimizer diagnostics steps."""
+    return [parameter.detach().clone() for parameter in parameters]
+
+
+def parameter_update_diagnostics(parameters, before, eps=1e-12):
+    """Measure the exact AdamW parameter displacement relative to parameter norm."""
+    parameters = list(parameters)
+    if len(parameters) != len(before):
+        raise ValueError("Parameter snapshot length changed across optimizer.step()")
+    if not parameters:
+        return {
+            "param_norm": float("nan"),
+            "update_norm": float("nan"),
+            "update_ratio": float("nan"),
+            "changed_element_fraction": float("nan"),
+        }
+    param_squared = None
+    update_squared = None
+    changed_elements = 0
+    total_elements = 0
+    for parameter, old_parameter in zip(parameters, before):
+        old_float = old_parameter.float()
+        parameter_float = parameter.detach().float()
+        current_param_squared = old_float.square().sum()
+        current_update_squared = (parameter_float - old_float).square().sum()
+        changed_elements += int(torch.count_nonzero(
+            parameter.detach() != old_parameter).item())
+        total_elements += parameter.numel()
+        param_squared = (current_param_squared if param_squared is None
+                         else param_squared + current_param_squared)
+        update_squared = (current_update_squared if update_squared is None
+                          else update_squared + current_update_squared)
+    param_norm = param_squared.sqrt()
+    update_norm = update_squared.sqrt()
+    return {
+        "param_norm": param_norm.item(),
+        "update_norm": update_norm.item(),
+        "update_ratio": (
+            (update_norm / param_norm).item()
+            if param_norm > eps else float("nan")),
+        "changed_element_fraction": changed_elements / total_elements,
+    }
+
+
+def build_optimizer_and_scheduler(model, lr, lr_min, betas, weight_decay,
+                                  total_steps, qformer_lr_scale=1.0):
+    """Build AdamW while keeping the Q-Former LR scale over the full cosine.
+
+    ``CosineAnnealingLR`` has one absolute ``eta_min`` for every parameter
+    group. With a scaled Q-Former initial LR that would silently erase the
+    scale late in training. A common multiplicative cosine factor preserves
+    both the initial and final LR ratios.
+    """
+    if qformer_lr_scale <= 0.0:
+        raise ValueError(
+            f"lava_qformer_lr_scale must be positive, got {qformer_lr_scale}")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+
+    named_parameters = [
+        (name, parameter) for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    qformer_parameters = [
+        parameter for name, parameter in named_parameters
+        if name.startswith("lava_world_encoder.")
+    ]
+    use_scaled_group = bool(qformer_parameters) and not math.isclose(
+        qformer_lr_scale, 1.0, rel_tol=0.0, abs_tol=1e-12)
+    if use_scaled_group:
+        qformer_ids = {id(parameter) for parameter in qformer_parameters}
+        main_parameters = [
+            parameter for _, parameter in named_parameters
+            if id(parameter) not in qformer_ids
+        ]
+        optimizer = AdamW(
+            [
+                {"params": main_parameters, "lr": lr},
+                {"params": qformer_parameters, "lr": lr * qformer_lr_scale},
+            ],
+            lr=lr,
+            betas=tuple(betas),
+            weight_decay=weight_decay,
+        )
+        final_factor = lr_min / lr
+
+        def cosine_factor(step):
+            progress = min(max(float(step) / float(total_steps), 0.0), 1.0)
+            return final_factor + (1.0 - final_factor) * (
+                1.0 + math.cos(math.pi * progress)) * 0.5
+
+        scheduler = LambdaLR(
+            optimizer, lr_lambda=[cosine_factor, cosine_factor])
+        qformer_group_index = 1
+    else:
+        optimizer = AdamW(
+            [parameter for _, parameter in named_parameters],
+            lr=lr,
+            betas=tuple(betas),
+            weight_decay=weight_decay,
+        )
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=lr_min)
+        qformer_group_index = 0
+    return optimizer, scheduler, qformer_parameters, qformer_group_index
 
 
 def should_run_lava_grad_diagnostics(next_global_step, is_update_boundary,
@@ -639,12 +830,18 @@ if __name__ == "__main__":
         config.training.get('lava_decay_start_ratio', 1.0))
     lava_grad_diagnostics_interval = int(
         config.training.get('lava_grad_diagnostics_interval', 0))
+    lava_qformer_lr_scale = float(
+        config.training.get('lava_qformer_lr_scale', 1.0))
     if not 0.0 <= lava_warmup_ratio <= 1.0:
         raise ValueError(f"lava_warmup_ratio must be in [0,1], got {lava_warmup_ratio}")
     if lava_grad_diagnostics_interval < 0:
         raise ValueError(
             "lava_grad_diagnostics_interval must be non-negative, got "
             f"{lava_grad_diagnostics_interval}")
+    if lava_qformer_lr_scale <= 0.0:
+        raise ValueError(
+            "lava_qformer_lr_scale must be positive, got "
+            f"{lava_qformer_lr_scale}")
     if lava_weight_schedule not in {'constant', 'step', 'cosine'}:
         raise ValueError(
             "lava_weight_schedule must be constant, step, or cosine, got "
@@ -685,6 +882,7 @@ if __name__ == "__main__":
             f"{config.training.get('lava_negative_window_multiplier', 4)}L, "
             f"{config.training.get('lava_negative_window_max', 32)}), "
             f"order_negative={config.training.lava_order_negative}, "
+            f"qformer_lr_scale={lava_qformer_lr_scale}, "
             f"grad_diagnostics_every={lava_grad_diagnostics_interval} steps")
 
     # =========================================================================
@@ -782,12 +980,17 @@ if __name__ == "__main__":
     # =========================================================================
     # 4. Optimizer / Scheduler
     # =========================================================================
-    optimizer = AdamW(
-        action_model.parameters(),
-        lr=lr,
-        betas=tuple(config.training.betas),
-        weight_decay=config.training.weight_decay,
-    )
+    optimizer_steps_per_epoch = max(1, len(train_dataloader) // grad_accum_steps)
+    total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
+    optimizer, scheduler, qformer_parameters, qformer_group_index = \
+        build_optimizer_and_scheduler(
+            action_model, lr, lr_min, config.training.betas,
+            config.training.weight_decay, total_optimizer_steps,
+            qformer_lr_scale=lava_qformer_lr_scale)
+    action_projector_parameters = [
+        parameter for name, parameter in action_model.named_parameters()
+        if parameter.requires_grad and name.startswith("lava_action_projector.")
+    ]
     lava_branch_parameters = [
         parameter for name, parameter in action_model.named_parameters()
         if name.startswith(("lava_world_encoder", "lava_action_projector"))
@@ -796,17 +999,15 @@ if __name__ == "__main__":
         raise RuntimeError("LAVA is enabled but no lava_* trainable parameters were found")
     lava_gradient_parameter_groups = build_lava_gradient_parameter_groups(action_model)
 
-    optimizer_steps_per_epoch = max(1, len(train_dataloader) // grad_accum_steps)
-    total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
     lava_warmup_steps = int(round(total_optimizer_steps * lava_warmup_ratio))
     lava_decay_start_step = int(round(
         total_optimizer_steps * lava_decay_start_ratio))
 
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=total_optimizer_steps,
-        eta_min=lr_min,
-    )
+    logger.info(
+        f"Optimizer LR groups: base={optimizer.param_groups[0]['lr']:.2e}, "
+        f"Q-Former={optimizer.param_groups[qformer_group_index]['lr']:.2e}; "
+        f"final base={lr_min:.2e}, "
+        f"final Q-Former={lr_min * lava_qformer_lr_scale:.2e}")
     if use_lava:
         logger.info(
             f"LAVA lambda schedule: warmup={lava_warmup_steps}, "
@@ -875,6 +1076,10 @@ if __name__ == "__main__":
     # =========================================================================
     # 6. Training Loop
     # =========================================================================
+    lava_health = LAVAHealthMonitor(
+        enabled=use_lava and float(config.training.get('lava_sample_ratio', 0.25)) > 0,
+        max_empty_batches=config.training.get('lava_max_empty_batches', 100))
+
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_save_dir = os.path.join(args.save_dir, f"sft_{timestamp}")
     os.makedirs(run_save_dir, exist_ok=True)
@@ -926,6 +1131,8 @@ if __name__ == "__main__":
                 loss, info_dic = model(batch, lava_weight=lava_weight)
                 loss = loss / grad_accum_steps
 
+            lava_health.check(batch, info_dic)
+
             for record in info_dic.pop('_action_similarity_audit', []):
                 task_name = str(record['task'])
                 scale = int(record['scale'])
@@ -936,15 +1143,26 @@ if __name__ == "__main__":
                     key = (task_name, scale, family)
                     aggregate = epoch_action_similarity_audit.setdefault(
                         key, {'count': 0, 'distance_sum': 0.0,
+                              'raw_distance_sum': 0.0,
                               'weight_sum': 0.0, 'below_half': 0,
-                              'arm_sum': 0.0, 'gripper_state_sum': 0.0,
-                              'gripper_change_sum': 0.0})
+                              'arm_state_sum': 0.0, 'arm_change_sum': 0.0,
+                              'gripper_state_sum': 0.0,
+                              'gripper_change_sum': 0.0,
+                              'calibrated_arm_state_sum': 0.0,
+                              'calibrated_arm_change_sum': 0.0,
+                              'calibrated_gripper_state_sum': 0.0,
+                              'calibrated_gripper_change_sum': 0.0})
                     aggregate['count'] += 1
                     aggregate['distance_sum'] += float(value['distance'])
+                    aggregate['raw_distance_sum'] += float(
+                        value.get('raw_distance', value['distance']))
                     aggregate['weight_sum'] += float(value['weight'])
                     aggregate['below_half'] += int(value['weight'] < 0.5)
-                    for component in ('arm', 'gripper_state', 'gripper_change'):
+                    for component in ('arm_state', 'arm_change',
+                                      'gripper_state', 'gripper_change'):
                         aggregate[f'{component}_sum'] += float(value[component])
+                        aggregate[f'calibrated_{component}_sum'] += float(
+                            value.get(f'calibrated_{component}', value[component]))
 
             loss_base_tensor = info_dic.pop('_loss_base_tensor', None)
             loss_lava_tensor = info_dic.pop('_loss_lava_tensor', None)
@@ -960,6 +1178,18 @@ if __name__ == "__main__":
                 'grad_norm_base_shared': float('nan'),
                 'grad_norm_lava_shared': float('nan'),
                 'weighted_grad_ratio': float('nan'),
+                'qformer_grad_norm': float('nan'),
+                'action_projector_grad_norm': float('nan'),
+                'qformer_action_projector_grad_ratio': float('nan'),
+                'qformer_param_norm': float('nan'),
+                'qformer_update_norm': float('nan'),
+                'qformer_update_ratio': float('nan'),
+                'qformer_changed_element_fraction': float('nan'),
+                'action_projector_param_norm': float('nan'),
+                'action_projector_update_norm': float('nan'),
+                'action_projector_update_ratio': float('nan'),
+                'action_projector_changed_element_fraction': float('nan'),
+                'qformer_action_projector_update_ratio': float('nan'),
             }
             if run_grad_diagnostics:
                 grad_diagnostics = compute_shared_gradient_diagnostics(
@@ -972,6 +1202,23 @@ if __name__ == "__main__":
                     f"Non-finite training loss at epoch={epoch + 1}, step={step + 1}: {info_dic}")
 
             loss.backward()
+
+            qformer_snapshot = None
+            action_projector_snapshot = None
+            if run_grad_diagnostics:
+                qformer_grad_norm = parameter_grad_norm(qformer_parameters)
+                action_projector_grad_norm = parameter_grad_norm(
+                    action_projector_parameters)
+                grad_diagnostics.update({
+                    'qformer_grad_norm': qformer_grad_norm,
+                    'action_projector_grad_norm': action_projector_grad_norm,
+                    'qformer_action_projector_grad_ratio': (
+                        qformer_grad_norm / action_projector_grad_norm
+                        if action_projector_grad_norm > 1e-12 else float('nan')),
+                })
+                qformer_snapshot = snapshot_parameters(qformer_parameters)
+                action_projector_snapshot = snapshot_parameters(
+                    action_projector_parameters)
 
             current_step_loss = loss.item() * grad_accum_steps
             epoch_loss += current_step_loss
@@ -986,11 +1233,38 @@ if __name__ == "__main__":
                     raise FloatingPointError(
                         f"Non-finite gradient norm at epoch={epoch + 1}, step={step + 1}")
                 optimizer.step()
+                if run_grad_diagnostics:
+                    qformer_update = parameter_update_diagnostics(
+                        qformer_parameters, qformer_snapshot)
+                    action_projector_update = parameter_update_diagnostics(
+                        action_projector_parameters, action_projector_snapshot)
+                    grad_diagnostics.update({
+                        'qformer_param_norm': qformer_update['param_norm'],
+                        'qformer_update_norm': qformer_update['update_norm'],
+                        'qformer_update_ratio': qformer_update['update_ratio'],
+                        'qformer_changed_element_fraction': (
+                            qformer_update['changed_element_fraction']),
+                        'action_projector_param_norm': (
+                            action_projector_update['param_norm']),
+                        'action_projector_update_norm': (
+                            action_projector_update['update_norm']),
+                        'action_projector_update_ratio': (
+                            action_projector_update['update_ratio']),
+                        'action_projector_changed_element_fraction': (
+                            action_projector_update['changed_element_fraction']),
+                        'qformer_action_projector_update_ratio': (
+                            qformer_update['update_ratio']
+                            / action_projector_update['update_ratio']
+                            if action_projector_update['update_ratio'] > 1e-12
+                            else float('nan')),
+                    })
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
                 current_lr = optimizer.param_groups[0]['lr']
+                current_qformer_lr = optimizer.param_groups[
+                    qformer_group_index]['lr']
                 scale_mean = float(np.mean(update_window_scales)) if update_window_scales else 0.0
                 scale_min = float(min(update_window_scales)) if update_window_scales else 0.0
                 scale_max = float(max(update_window_scales)) if update_window_scales else 0.0
@@ -1001,6 +1275,7 @@ if __name__ == "__main__":
                         if lambda_lava_max > 0.0 else 0.0),
                     'lava_weight_phase': lava_weight_phase,
                     'learning_rate': current_lr,
+                    'qformer_learning_rate': current_qformer_lr,
                     'grad_norm': grad_norm,
                     'lava_branch_grad_norm': lava_branch_grad_norm,
                     **grad_diagnostics,
@@ -1082,7 +1357,13 @@ if __name__ == "__main__":
                             f"GradCos: {grad_diagnostics['grad_cos_shared']:.3f} "
                             f"GradCos9_10: {grad_diagnostics.get('grad_cos_b9_10', float('nan')):.3f} "
                             f"WeightedGradRatio: "
-                            f"{grad_diagnostics['weighted_grad_ratio']:.3f} ")
+                            f"{grad_diagnostics['weighted_grad_ratio']:.3f} "
+                            f"QFGrad: {grad_diagnostics['qformer_grad_norm']:.3f} "
+                            f"QFUpdate: {grad_diagnostics['qformer_update_ratio']:.2e} "
+                            f"QFChanged: "
+                            f"{grad_diagnostics['qformer_changed_element_fraction']:.2f} "
+                            f"QF/ActionProjUpdate: "
+                            f"{grad_diagnostics['qformer_action_projector_update_ratio']:.3f} ")
                     log_msg += (
                         f"GradNorm: {grad_norm:.3f} "
                         f"LAVABranchGrad: {lava_branch_grad_norm:.3f} "
@@ -1148,13 +1429,25 @@ if __name__ == "__main__":
                     str(scale), {})[family] = {
                         'count': count,
                         'mean_distance': values['distance_sum'] / count,
+                        'mean_raw_distance': values['raw_distance_sum'] / count,
                         'mean_weight': values['weight_sum'] / count,
                         'weight_below_0_5_fraction': values['below_half'] / count,
-                        'mean_arm_distance': values['arm_sum'] / count,
+                        'mean_arm_state_distance': (
+                            values['arm_state_sum'] / count),
+                        'mean_arm_change_distance': (
+                            values['arm_change_sum'] / count),
                         'mean_gripper_state_distance': (
                             values['gripper_state_sum'] / count),
                         'mean_gripper_change_distance': (
                             values['gripper_change_sum'] / count),
+                        'mean_calibrated_arm_state_distance': (
+                            values['calibrated_arm_state_sum'] / count),
+                        'mean_calibrated_arm_change_distance': (
+                            values['calibrated_arm_change_sum'] / count),
+                        'mean_calibrated_gripper_state_distance': (
+                            values['calibrated_gripper_state_sum'] / count),
+                        'mean_calibrated_gripper_change_distance': (
+                            values['calibrated_gripper_change_sum'] / count),
                     }
             audit_path = os.path.join(
                 run_save_dir, 'log',

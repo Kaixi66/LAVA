@@ -98,25 +98,26 @@ model:
     # The policy still continues through all remaining blocks, final_norm, and its head.
     action_target_layer: "final"
 
-    # World Residual
+    # V6: shared frame-state encoder, then latent differences.
     dino_target_layer: -4
-    residual_dim: 32
+    world_encoding: "state_delta"
+    time_channel: false
+    residual_dim: 128
 
     qformer:
       hidden_dim: 256
-      num_queries: 1
+      num_queries: 8
+      query_dim: 16
       num_layers: 2
       num_heads: 4
 
     # Differentiable closed-form path LogSig order (1 or 2)
     logsig_depth: 2
 
-    # V4: population calibration preserves per-path order strength instead of
-    # forcing the first and second LogSig levels to unit norm independently.
+    # V2/V3 behavior: normalize Level-1 and Level-2 independently, then join.
+    # This gives every non-degenerate depth-2 path equal endpoint/order energy.
     signature_normalization:
-      type: "ema_calibrated"
-      ema_momentum: 0.99
-      level2_weight: 0.5
+      type: "per_level_unit"
 
   # Action Expert configuration
   action_expert:
@@ -163,25 +164,22 @@ training:
   lava_sample_ratio: 0.125
   lava_scale_sampling: "batch_uniform"  # one scale per batch; 5-batch shuffled cycle
   lava_sampling_balance: "task_episode"  # LAVA anchors are task/episode balanced
-  # V4 combines cross-task batch paths, same-episode local/far paths, and
-  # count-balanced block-swap/full-derangement order negatives.
-  lava_negative_mode: "mixed"     # "batch", "episode_local", or "mixed"
+  # Individual same-scale batch negatives include same-task paths; paired
+  # local/far and the existing pooled order candidate are retained.
+  lava_negative_mode: "mixed_batch"
   lava_negative_window_multiplier: 4
   lava_negative_window_max: 32     # R(L) = min(4L, 32)
   # lava_scale_probs: [0.25, 0.25, 0.20, 0.15, 0.15]  # used only for weighted
   lava_warmup_ratio: 0.05
-  lava_order_negative: true      # block-swap + full-derangement for L >= 2
+  lava_order_negative: true      # V5.1: block-swap + full-derangement for L >= 4
   lava_grad_diagnostics_interval: 200
+  # 1.0 preserves V5. Experiments can slow the complete World Residual
+  # Q-Former while retaining the same relative scale over the cosine schedule.
+  lava_qformer_lr_scale: 1.0
 
-  # V5: gripper-aware, detached action similarity only softens false negatives.
-  # Order corruptions remain unweighted hard negatives.
-  lava_action_similarity_weighting: true
-  lava_action_similarity_min_weight: 0.1
-  lava_action_similarity_beta_momentum: 0.99
-  lava_action_similarity_beta_multiplier: 1.0
-  lava_action_gripper_indices: [6, 13]
-  lava_action_gripper_state_weight: 0.5
-  lava_action_gripper_change_weight: 0.5
+  # No action-based weighting for batch, local, far, or order candidates.
+  lava_action_similarity_weighting: false
+  lava_action_component_calibration: false
 
   # Velocity weighting (sample-level)
   use_vel_weight: false

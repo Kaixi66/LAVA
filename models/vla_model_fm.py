@@ -169,12 +169,15 @@ class FutureFeatureDecoder(nn.Module):
 
 
 class WorldResidualEncoder(nn.Module):
-    """Compress a DINO patch-feature difference into one world residual."""
+    """Encode DINO patches; legacy pooled residuals or ordered per-frame state queries."""
 
     def __init__(self, feat_dim, residual_dim, hidden_dim=256,
-                 num_queries=1, num_layers=2, num_heads=4):
+                 num_queries=1, num_layers=2, num_heads=4, query_dim=None):
         super().__init__()
         self.num_queries = num_queries
+        self.query_dim = query_dim
+        if query_dim is not None and residual_dim != num_queries * query_dim:
+            raise ValueError("State latent dimension must equal num_queries * query_dim")
         self.input_norm = nn.LayerNorm(feat_dim)
         self.input_proj = nn.Linear(feat_dim, hidden_dim)
         self.query_embed = nn.Parameter(torch.empty(1, num_queries, hidden_dim))
@@ -191,18 +194,25 @@ class WorldResidualEncoder(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, residual_dim)
+        self.output_proj = nn.Linear(hidden_dim, residual_dim if query_dim is None else query_dim)
 
     def forward(self, feature_differences):
-        """feature_differences: (B, num_patches, dino_dim)."""
+        """Input is (B, patches, dino_dim): frame states in V6, differences in legacy mode."""
         batch_size = feature_differences.shape[0]
         memory = self.input_proj(self.input_norm(feature_differences))
         queries = self.query_embed.expand(batch_size, -1, -1)
         residual_queries = self.decoder(queries, memory)
-        # One query is the fixed main setting. Mean pooling keeps the exposed
-        # num_queries architecture ablation well-defined without changing d_c.
-        residual = self.output_norm(residual_queries).mean(dim=1)
-        return self.output_proj(residual)
+        state_queries = self.output_norm(residual_queries)
+        if self.query_dim is None:
+            # Legacy checkpoint architecture: mean queries before projection.
+            return self.output_proj(state_queries.mean(dim=1))
+        # Keep ordered query slots. Project and subtract in FP32 even during
+        # BF16 training: small state changes should not vanish in output rounding.
+        with torch.autocast(device_type=state_queries.device.type, enabled=False):
+            states = F.linear(state_queries.float(), self.output_proj.weight.float(),
+                              self.output_proj.bias.float())
+        return states.flatten(1)
+
 
 
 def sample_full_shuffle_permutation(length, device=None):
@@ -431,8 +441,68 @@ class EMAActionDistanceCalibrator(nn.Module):
         return (self.ema_beta[index].detach() * self.multiplier).clamp_min(self.eps)
 
 
+class EMAActionComponentCalibrator(nn.Module):
+    """Per-scale calibration that puts action descriptor components on comparable scales."""
+
+    component_names = (
+        "arm_state", "arm_change", "gripper_state", "gripper_change")
+
+    def __init__(self, scales=(1, 2, 4, 8, 16), momentum=0.99, eps=1e-8):
+        super().__init__()
+        self.scales = tuple(int(scale) for scale in scales)
+        self.scale_to_index = {scale: index for index, scale in enumerate(self.scales)}
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+        if not 0.0 <= self.momentum < 1.0:
+            raise ValueError("Action-component EMA momentum must be in [0,1)")
+        shape = (len(self.scales), len(self.component_names))
+        self.register_buffer("ema_beta", torch.ones(shape, dtype=torch.float32))
+        self.register_buffer("ema_initialized", torch.zeros(shape, dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, scale, family_components):
+        """Equal-weight family medians for every descriptor component.
+
+        Each family tensor has shape ``(..., 4)``. A zero-only component stays
+        uninitialized until it first carries a non-zero signal, preventing an
+        epsilon initialization from amplifying a later non-zero batch.
+        """
+        scale_index = self.scale_to_index[int(scale)]
+        for component_index in range(len(self.component_names)):
+            medians = []
+            for values in family_components:
+                if values is None or not values.numel():
+                    continue
+                component = values[..., component_index].detach().float()
+                component = component[torch.isfinite(component)]
+                if component.numel():
+                    medians.append(component.median())
+            if not medians:
+                continue
+            aggregate = torch.stack(medians).mean()
+            if not torch.isfinite(aggregate) or aggregate <= self.eps:
+                continue
+            initialized = self.ema_initialized[scale_index, component_index]
+            target = self.ema_beta[scale_index, component_index]
+            updated = (target * self.momentum
+                       + aggregate * (1.0 - self.momentum))
+            target.copy_(torch.where(initialized, updated, aggregate))
+            initialized.fill_(True)
+        return self.beta(scale)
+
+    def beta(self, scale):
+        scale_index = self.scale_to_index[int(scale)]
+        values = self.ema_beta[scale_index].detach()
+        initialized = self.ema_initialized[scale_index]
+        # An unseen/zero-only component contributes its raw (normally zero)
+        # value instead of receiving an arbitrary large rescaling.
+        return torch.where(initialized, values.clamp_min(self.eps),
+                           torch.ones_like(values))
+
+
 def action_path_distance(left_normalized, left_raw, right_normalized, right_raw,
-                         gripper_indices=(6, 13), gripper_state_weight=0.5,
+                         gripper_indices=(6, 13), arm_state_weight=0.5,
+                         arm_change_weight=0.5, gripper_state_weight=0.5,
                          gripper_change_weight=0.5):
     """Detached RoboTwin action descriptor distance for two equal-length paths."""
     if left_normalized.shape != right_normalized.shape or left_raw.shape != right_raw.shape:
@@ -442,16 +512,21 @@ def action_path_distance(left_normalized, left_raw, right_normalized, right_raw,
     if any(index < 0 or index >= action_dim for index in gripper_indices):
         raise ValueError(f"Invalid gripper indices {gripper_indices} for action_dim={action_dim}")
     arm_indices = [index for index in range(action_dim) if index not in gripper_indices]
-    left_arm_delta = torch.diff(left_normalized[..., arm_indices].detach().float(), dim=0)
-    right_arm_delta = torch.diff(right_normalized[..., arm_indices].detach().float(), dim=0)
+    left_arm = left_normalized[..., arm_indices].detach().float()
+    right_arm = right_normalized[..., arm_indices].detach().float()
+    left_arm_delta = torch.diff(left_arm, dim=0)
+    right_arm_delta = torch.diff(right_arm, dim=0)
     left_grip = left_raw[..., list(gripper_indices)].detach().float()
     right_grip = right_raw[..., list(gripper_indices)].detach().float()
-    arm = F.mse_loss(left_arm_delta, right_arm_delta)
+    arm_state = F.mse_loss(left_arm, right_arm)
+    arm_change = F.mse_loss(left_arm_delta, right_arm_delta)
     grip_state = F.mse_loss(left_grip, right_grip)
     grip_change = F.mse_loss(torch.diff(left_grip, dim=0), torch.diff(right_grip, dim=0))
-    combined = (arm + float(gripper_state_weight) * grip_state
+    combined = (float(arm_state_weight) * arm_state
+                + float(arm_change_weight) * arm_change
+                + float(gripper_state_weight) * grip_state
                 + float(gripper_change_weight) * grip_change)
-    return arm, grip_state, grip_change, combined
+    return arm_state, arm_change, grip_state, grip_change, combined
 
 
 def action_similarity_weight(distance, beta, min_weight=0.1):
@@ -574,20 +649,27 @@ class VLAModel(nn.Module):
                  use_lava=False,
                  lava_dino_feat_dim=None,
                  lava_residual_dim=32,
+                 lava_world_encoding="feature_delta",
+                 lava_time_channel=True,
+                 lava_query_dim=16,
                  lava_qformer_hidden_dim=256,
                  lava_qformer_num_queries=1,
                  lava_qformer_num_layers=2,
                  lava_qformer_num_heads=4,
                  lava_logsig_depth=2,
                  lava_action_target_layer="final",
+                 lava_signature_normalization="ema_calibrated",
                  lava_scales=(1, 2, 4, 8, 16),
                  lava_signature_ema_momentum=0.99,
                  lava_signature_level2_weight=0.5,
                  lava_action_similarity_weighting=False,
+                 lava_action_component_calibration=False,
                  lava_action_similarity_min_weight=0.1,
                  lava_action_similarity_beta_momentum=0.99,
                  lava_action_similarity_beta_multiplier=1.0,
                  lava_action_gripper_indices=(6, 13),
+                 lava_action_arm_state_weight=0.5,
+                 lava_action_arm_change_weight=0.5,
                  lava_action_gripper_state_weight=0.5,
                  lava_action_gripper_change_weight=0.5,
                  ):
@@ -605,20 +687,47 @@ class VLAModel(nn.Module):
 
         self.use_future_feat = use_future_feat
         self.use_lava = use_lava
+        self.lava_world_encoding = str(lava_world_encoding)
+        if self.lava_world_encoding not in {"feature_delta", "state_delta"}:
+            raise ValueError("lava_world_encoding must be feature_delta or state_delta")
+        self.lava_time_channel = bool(lava_time_channel)
         self.lava_residual_dim = lava_residual_dim
         self.lava_logsig_depth = lava_logsig_depth
+        self.lava_signature_normalization = str(
+            lava_signature_normalization).lower()
+        if self.lava_signature_normalization not in {
+                "per_level_unit", "ema_calibrated"}:
+            raise ValueError(
+                "lava_signature_normalization must be per_level_unit or "
+                f"ema_calibrated, got {self.lava_signature_normalization}")
         self.lava_action_similarity_weighting = bool(
             lava_action_similarity_weighting)
+        self.lava_action_component_calibration = bool(
+            lava_action_component_calibration)
         self.lava_action_similarity_min_weight = float(
             lava_action_similarity_min_weight)
         self.lava_action_gripper_indices = tuple(
             int(index) for index in lava_action_gripper_indices)
+        self.lava_action_arm_state_weight = float(
+            lava_action_arm_state_weight)
+        self.lava_action_arm_change_weight = float(
+            lava_action_arm_change_weight)
         self.lava_action_gripper_state_weight = float(
             lava_action_gripper_state_weight)
         self.lava_action_gripper_change_weight = float(
             lava_action_gripper_change_weight)
+        if any(weight < 0.0 for weight in (
+                self.lava_action_arm_state_weight,
+                self.lava_action_arm_change_weight,
+                self.lava_action_gripper_state_weight,
+                self.lava_action_gripper_change_weight)):
+            raise ValueError("Action descriptor weights must be non-negative")
         if not 0.0 <= self.lava_action_similarity_min_weight <= 1.0:
             raise ValueError("lava_action_similarity_min_weight must be in [0,1]")
+        if (self.lava_action_component_calibration
+                and not self.lava_action_similarity_weighting):
+            raise ValueError(
+                "Action-component calibration requires action-similarity weighting")
         if isinstance(lava_action_target_layer, str):
             normalized_target = lava_action_target_layer.strip().lower()
             if normalized_target == "final":
@@ -737,6 +846,7 @@ class VLAModel(nn.Module):
             self.lava_world_encoder = WorldResidualEncoder(
                 feat_dim=lava_dino_feat_dim,
                 residual_dim=lava_residual_dim,
+                query_dim=(lava_query_dim if self.lava_world_encoding == "state_delta" else None),
                 hidden_dim=lava_qformer_hidden_dim,
                 num_queries=lava_qformer_num_queries,
                 num_layers=lava_qformer_num_layers,
@@ -749,11 +859,17 @@ class VLAModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(128, lava_residual_dim),
             )
-            self.lava_signature_calibrator = EMALogSignatureCalibrator(
-                scales=lava_scales,
-                momentum=lava_signature_ema_momentum,
-                level2_weight=lava_signature_level2_weight,
-            )
+            if self.lava_signature_normalization == "ema_calibrated":
+                self.lava_signature_calibrator = EMALogSignatureCalibrator(
+                    scales=lava_scales,
+                    momentum=lava_signature_ema_momentum,
+                    level2_weight=lava_signature_level2_weight,
+                )
+            else:
+                # V2/V3 behavior: each non-zero LogSig level is normalized
+                # independently before concatenation. Keeping no calibrator
+                # buffers also preserves strict loading of legacy checkpoints.
+                self.lava_signature_calibrator = None
             # Conditional registration is deliberate: V4 state dicts do not
             # acquire V5-only keys and therefore still strict-load when disabled.
             if self.lava_action_similarity_weighting:
@@ -762,6 +878,12 @@ class VLAModel(nn.Module):
                     momentum=lava_action_similarity_beta_momentum,
                     multiplier=lava_action_similarity_beta_multiplier,
                 )
+                if self.lava_action_component_calibration:
+                    self.lava_action_component_calibrator = (
+                        EMAActionComponentCalibrator(
+                            scales=lava_scales,
+                            momentum=lava_action_similarity_beta_momentum,
+                        ))
 
     def forward(self,
                 t,
@@ -877,11 +999,37 @@ class VLAModel(nn.Module):
                           temporal_negative_normalized_actions=None,
                           temporal_negative_raw_actions=None,
                           far_negative_normalized_actions=None,
-                          far_negative_raw_actions=None):
+                          far_negative_raw_actions=None,
+                          world_feature_paths=None,
+                          temporal_negative_feature_paths=None,
+                          far_negative_feature_paths=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
-        sample_count = len(world_feature_differences)
+        # Keep legacy mixed-family checkpoints reproducible. The new mode uses
+        # the same local/far sampler but exposes every same-scale batch path as
+        # an individual, unweighted candidate (including same-task paths).
+        individual_batch_negatives = negative_mode == "mixed_batch"
+        if individual_batch_negatives:
+            if self.lava_action_similarity_weighting:
+                raise ValueError("mixed_batch requires action-similarity weighting disabled")
+            negative_mode = "mixed"
+        state_mode = self.lava_world_encoding == "state_delta"
+        if state_mode:
+            if world_feature_differences is not None or temporal_negative_feature_differences is not None or far_negative_feature_differences is not None:
+                raise ValueError("state_delta requires full frame feature paths, not DINO differences")
+            if world_feature_paths is None:
+                raise ValueError("state_delta requires world_feature_paths")
+            world_inputs = world_feature_paths
+            local_inputs = temporal_negative_feature_paths
+            far_inputs = far_negative_feature_paths
+        else:
+            if any(x is not None for x in (world_feature_paths, temporal_negative_feature_paths, far_negative_feature_paths)):
+                raise ValueError("feature_delta cannot receive full frame feature paths")
+            world_inputs = world_feature_differences
+            local_inputs = temporal_negative_feature_differences
+            far_inputs = far_negative_feature_differences
+        sample_count = len(world_inputs)
         if sample_count == 0:
             zero = action_hidden.sum() * 0.0
             return zero, {
@@ -924,26 +1072,26 @@ class VLAModel(nn.Module):
                 "negative_mode must be 'batch', 'episode_local', or 'mixed', "
                 f"got {negative_mode}")
         if negative_mode in {"episode_local", "mixed"}:
-            if temporal_negative_feature_differences is None:
+            if local_inputs is None:
                 raise ValueError(
-                    f"{negative_mode} mode requires local-negative feature differences")
-            if len(temporal_negative_feature_differences) != sample_count:
+                    f"{negative_mode} mode requires local-negative feature paths")
+            if len(local_inputs) != sample_count:
                 raise ValueError(
                     "Every positive LAVA path requires one temporal-negative path")
             if negative_mode == "mixed":
-                if far_negative_feature_differences is None:
+                if far_inputs is None:
                     raise ValueError(
-                        "mixed mode requires far-negative feature differences")
-                if len(far_negative_feature_differences) != sample_count:
+                        "mixed mode requires far-negative feature paths")
+                if len(far_inputs) != sample_count:
                     raise ValueError(
                         "Every positive LAVA path requires one far-negative path")
-            elif far_negative_feature_differences is not None:
+            elif far_inputs is not None:
                 raise ValueError(
-                    "episode_local mode must not receive far-negative differences")
-        elif (temporal_negative_feature_differences is not None
-              or far_negative_feature_differences is not None):
+                    "episode_local mode must not receive far-negative paths")
+        elif (local_inputs is not None
+              or far_inputs is not None):
             raise ValueError(
-                "batch mode must not receive paired negative feature differences")
+                "batch mode must not receive paired negative feature paths")
 
         batch_indices = batch_indices.to(action_hidden.device, dtype=torch.long)
         interval_starts = interval_starts.to(action_hidden.device, dtype=torch.long)
@@ -952,43 +1100,39 @@ class VLAModel(nn.Module):
             raise ValueError("LAVA batch metadata and feature-difference counts do not match")
 
         lengths = [int(scale) for scale in interval_scales.tolist()]
+        groups = [world_inputs]
+        if local_inputs is not None:
+            groups.append(local_inputs)
+        if far_inputs is not None:
+            groups.append(far_inputs)
+        input_lengths = [length + int(state_mode) for length in lengths]
+        paths = []
+        for group in groups:
+            for path, expected in zip(group, input_lengths):
+                if path.shape[0] != expected:
+                    raise ValueError(f"LAVA feature path length {path.shape[0]} != {expected}")
+                paths.append(path.to(action_hidden.device, dtype=action_hidden.dtype))
+        encoded = self.lava_world_encoder(torch.cat(paths, dim=0))
+        encoded_paths = list(encoded.split(input_lengths * len(groups), dim=0))
+        residual_paths = ([path[1:] - path[:-1] for path in encoded_paths]
+                          if state_mode else encoded_paths)
+        world_residual_paths = residual_paths[:sample_count]
+        temporal_negative_residual_paths = (
+            residual_paths[sample_count:2 * sample_count] if local_inputs is not None else None)
+        far_negative_residual_paths = (
+            residual_paths[2 * sample_count:] if far_inputs is not None else None)
+        flat_world_residuals = torch.cat(world_residual_paths)
+        # Diagnostics use actual input transitions; no extra trainable encoding.
+        positive_inputs = paths[:sample_count]
         flat_world = torch.cat([
-            differences.to(action_hidden.device, dtype=action_hidden.dtype)
-            for differences in world_feature_differences
-        ], dim=0)
-        all_world_inputs = flat_world
-        flat_temporal_negative_world = None
-        flat_far_negative_world = None
-        if negative_mode in {"episode_local", "mixed"}:
-            flat_temporal_negative_world = torch.cat([
-                differences.to(action_hidden.device, dtype=action_hidden.dtype)
-                for differences in temporal_negative_feature_differences
-            ], dim=0)
-            all_world_inputs = torch.cat(
-                (flat_world, flat_temporal_negative_world), dim=0)
-            if negative_mode == "mixed":
-                flat_far_negative_world = torch.cat([
-                    differences.to(action_hidden.device, dtype=action_hidden.dtype)
-                    for differences in far_negative_feature_differences
-                ], dim=0)
-                all_world_inputs = torch.cat(
-                    (all_world_inputs, flat_far_negative_world), dim=0)
-        all_world_residuals = self.lava_world_encoder(all_world_inputs)
-        flat_world_residuals = all_world_residuals[:flat_world.shape[0]]
-        world_residual_paths = list(flat_world_residuals.split(lengths, dim=0))
-        temporal_negative_residual_paths = None
-        far_negative_residual_paths = None
-        if negative_mode in {"episode_local", "mixed"}:
-            positive_end = flat_world.shape[0]
-            temporal_end = positive_end + flat_temporal_negative_world.shape[0]
-            flat_temporal_negative_residuals = all_world_residuals[
-                positive_end:temporal_end]
-            temporal_negative_residual_paths = list(
-                flat_temporal_negative_residuals.split(lengths, dim=0))
-            if negative_mode == "mixed":
-                flat_far_negative_residuals = all_world_residuals[temporal_end:]
-                far_negative_residual_paths = list(
-                    flat_far_negative_residuals.split(lengths, dim=0))
+            path[1:].float() - path[:-1].float() if state_mode else path
+            for path in positive_inputs])
+        state_endpoint_error = float("nan")
+        if state_mode:
+            with torch.no_grad():
+                state_endpoint_error = max(
+                    (residual.sum(0) - (state[-1] - state[0])).abs().max().item()
+                    for residual, state in zip(world_residual_paths, encoded_paths))
 
         action_residual_paths = []
         for sample_idx, start, scale in zip(
@@ -1010,16 +1154,24 @@ class VLAModel(nn.Module):
         action_level2_raw_norms = []
         world_level1_raw_norms = []
         world_level2_raw_norms = []
+        def raw_signature_levels(increments):
+            if state_mode:
+                # einsum is autocast-eligible even for float() inputs. Keep V6
+                # signed areas in FP32 as well as the state differences.
+                with torch.autocast(device_type=increments.device.type, enabled=False):
+                    return _raw_logsignature_levels(increments)
+            return _raw_logsignature_levels(increments)
+
         time_channels = []
         for action_path, world_path, scale in zip(
                 action_residual_paths, world_residual_paths, lengths):
             time_channel = torch.full(
-                (scale, 1), 1.0 / scale, device=action_path.device, dtype=action_path.dtype)
+                (scale, int(self.lava_time_channel)), 1.0 / scale, device=action_path.device, dtype=action_path.dtype)
             time_channels.append(time_channel)
             action_increments = torch.cat((action_path, time_channel), dim=-1)
             world_increments = torch.cat((world_path, time_channel), dim=-1)
-            action_levels = _raw_logsignature_levels(action_increments)
-            world_levels = _raw_logsignature_levels(world_increments)
+            action_levels = raw_signature_levels(action_increments)
+            world_levels = raw_signature_levels(world_increments)
             action_raw_levels.append(action_levels)
             world_raw_levels.append(world_levels)
             action_level1_raw_norms.append(action_levels[0].detach().norm())
@@ -1027,9 +1179,9 @@ class VLAModel(nn.Module):
             world_level1_raw_norms.append(world_levels[0].detach().norm())
             world_level2_raw_norms.append(world_levels[1].detach().norm())
 
-        # Update only from positive paths. Paired negatives then use exactly the
-        # same detached population calibration in this forward pass.
-        if self.training:
+        # EMA mode updates only from positive paths. Paired negatives then use
+        # exactly the same detached population calibration in this forward.
+        if self.training and self.lava_signature_calibrator is not None:
             self.lava_signature_calibrator.update(
                 "action", [value[0] for value in action_raw_levels],
                 [value[1] for value in action_raw_levels], lengths)
@@ -1037,26 +1189,53 @@ class VLAModel(nn.Module):
                 "world", [value[0] for value in world_raw_levels],
                 [value[1] for value in world_raw_levels], lengths)
 
+        def build_signature(levels, modality, scale):
+            if self.lava_signature_calibrator is not None:
+                return self.lava_signature_calibrator(
+                    *levels, modality, scale, depth=self.lava_logsig_depth)
+
+            level_one = F.normalize(levels[0].float(), dim=0, eps=1e-6)
+            if self.lava_logsig_depth == 1:
+                return level_one, {
+                    "level1_calibrated_norm": level_one.detach().norm(),
+                    "level2_calibrated_norm": level_one.new_tensor(0.0),
+                    "level2_energy_fraction": level_one.new_tensor(0.0),
+                    "level1_ema_rms": level_one.new_tensor(float("nan")),
+                    "level2_ema_rms": level_one.new_tensor(float("nan")),
+                }
+            level_two = F.normalize(levels[1].float(), dim=0, eps=1e-6)
+            joined = torch.cat((level_one, level_two), dim=0)
+            energy_one = level_one.square().sum()
+            energy_two = level_two.square().sum()
+            signature = F.normalize(joined, dim=0, eps=1e-6)
+            return signature, {
+                "level1_calibrated_norm": level_one.detach().norm(),
+                "level2_calibrated_norm": level_two.detach().norm(),
+                "level2_energy_fraction": (
+                    energy_two / (energy_one + energy_two).clamp_min(1e-12)),
+                "level1_ema_rms": level_one.new_tensor(float("nan")),
+                "level2_ema_rms": level_one.new_tensor(float("nan")),
+            }
+
         action_signatures = []
         world_signatures = []
         action_calibration = []
         world_calibration = []
         for action_levels, world_levels, scale in zip(
                 action_raw_levels, world_raw_levels, lengths):
-            action_signature, action_stats = self.lava_signature_calibrator(
-                *action_levels, "action", scale, depth=self.lava_logsig_depth)
-            world_signature, world_stats = self.lava_signature_calibrator(
-                *world_levels, "world", scale, depth=self.lava_logsig_depth)
+            action_signature, action_stats = build_signature(
+                action_levels, "action", scale)
+            world_signature, world_stats = build_signature(
+                world_levels, "world", scale)
             action_signatures.append(action_signature)
             world_signatures.append(world_signature)
             action_calibration.append(action_stats)
             world_calibration.append(world_stats)
 
         def calibrated_world_signature(path, time_channel, scale):
-            levels = _raw_logsignature_levels(
+            levels = raw_signature_levels(
                 torch.cat((path, time_channel), dim=-1))
-            return self.lava_signature_calibrator(
-                *levels, "world", scale, depth=self.lava_logsig_depth)[0]
+            return build_signature(levels, "world", scale)[0]
 
         temporal_negative_signatures = []
         far_negative_signatures = []
@@ -1072,7 +1251,10 @@ class VLAModel(nn.Module):
             if far_negative_residual_paths is not None:
                 far_negative_signatures.append(calibrated_world_signature(
                     far_negative_residual_paths[sample_idx], time_channel, scale))
-            if order_negative and scale >= 2:
+            # V5.1: two-transition paths carry almost no reliable order signal
+            # (V5 order accuracy was ~chance at L=2). Keep both order
+            # corruptions as hard negatives only where L >= 4.
+            if order_negative and scale >= 4:
                 block_permutation = sample_contiguous_block_swap_permutation(
                     scale, device=world_path.device)
                 derangement_permutation = sample_full_shuffle_permutation(
@@ -1086,6 +1268,13 @@ class VLAModel(nn.Module):
                         world_path[derangement_permutation], time_channel, scale))
                     derangement_action_indices.append(sample_idx)
 
+        with torch.no_grad():
+            order_distances = [
+                (signature - world_signatures[index]).float().norm()
+                for signatures, indices in (
+                    (block_swap_signatures, block_action_indices),
+                    (derangement_signatures, derangement_action_indices))
+                for signature, index in zip(signatures, indices)]
         action_signatures = torch.stack(action_signatures)
         world_signatures = torch.stack(world_signatures)
         device = action_signatures.device
@@ -1194,6 +1383,9 @@ class VLAModel(nn.Module):
                 task_shortcut_gap = same_task_negative_sim - cross_task_negative_sim
 
         cross_same_scale_mask = cross_task & same_scale
+        batch_negative_mask = off_diagonal & same_scale
+        batch_negative_values = positive_world_logits.masked_fill(
+            ~batch_negative_mask, -torch.inf)
         cross_task_family_values, cross_task_candidate_counts = family_logmeanexp(
             positive_world_logits.masked_fill(~cross_same_scale_mask, -torch.inf))
         raw_cross_task_family_values = cross_task_family_values
@@ -1259,35 +1451,41 @@ class VLAModel(nn.Module):
                     key: torch.full(
                         positive_world_logits.shape, torch.nan,
                         device=device, dtype=torch.float32)
-                    for key in ("arm", "gripper_state", "gripper_change")}
+                    for key in ("arm_state", "arm_change", "gripper_state",
+                                "gripper_change")}
                 local_components = {
                     key: torch.full(
                         positive_values.shape, torch.nan,
                         device=device, dtype=torch.float32)
-                    for key in ("arm", "gripper_state", "gripper_change")}
+                    for key in ("arm_state", "arm_change", "gripper_state",
+                                "gripper_change")}
                 far_components = {
                     key: torch.full(
                         positive_values.shape, torch.nan,
                         device=device, dtype=torch.float32)
-                    for key in ("arm", "gripper_state", "gripper_change")}
+                    for key in ("arm_state", "arm_change", "gripper_state",
+                                "gripper_change")}
                 cross_weights = torch.ones(
                     positive_world_logits.shape, device=device, dtype=torch.float32)
                 local_weights = torch.ones(
                     positive_values.shape, device=device, dtype=torch.float32)
                 far_weights = torch.ones(
                     positive_values.shape, device=device, dtype=torch.float32)
-                component_values = {"arm": [], "gripper_state": [],
-                                    "gripper_change": [], "combined": []}
+                raw_component_values = {
+                    "arm_state": [], "arm_change": [], "gripper_state": [],
+                    "gripper_change": [], "combined": []}
 
                 def measure(left_index, right_normalized, right_raw):
                     values = action_path_distance(
                         positive_norm_paths[left_index], positive_raw_paths[left_index],
                         right_normalized, right_raw,
                         gripper_indices=self.lava_action_gripper_indices,
+                        arm_state_weight=self.lava_action_arm_state_weight,
+                        arm_change_weight=self.lava_action_arm_change_weight,
                         gripper_state_weight=self.lava_action_gripper_state_weight,
                         gripper_change_weight=self.lava_action_gripper_change_weight)
-                    for key, value in zip(component_values, values):
-                        component_values[key].append(value.detach().float())
+                    for key, value in zip(raw_component_values, values):
+                        raw_component_values[key].append(value.detach().float())
                     return tuple(value.to(device=device) for value in values)
 
                 for left in range(sample_count):
@@ -1311,11 +1509,83 @@ class VLAModel(nn.Module):
                     for key, value in zip(far_components, measured[:-1]):
                         far_components[key][left] = value
 
+                raw_cross_distances = cross_distances.clone()
+                raw_local_distances = local_distances.clone()
+                raw_far_distances = far_distances.clone()
+                calibrated_cross_components = {
+                    key: value.clone() for key, value in cross_components.items()}
+                calibrated_local_components = {
+                    key: value.clone() for key, value in local_components.items()}
+                calibrated_far_components = {
+                    key: value.clone() for key, value in far_components.items()}
+
                 per_scale_medians = {}
                 for scale in sorted(set(lengths)):
                     scale_mask = interval_scales == scale
-                    cross_values = cross_distances[
-                        scale_mask[:, None] & cross_same_scale_mask]
+                    cross_mask = scale_mask[:, None] & cross_same_scale_mask
+
+                    if self.lava_action_component_calibration:
+                        def stacked_components(components, mask):
+                            return torch.stack([
+                                components[key][mask]
+                                for key in ("arm_state", "arm_change",
+                                            "gripper_state", "gripper_change")
+                            ], dim=-1)
+
+                        component_families = (
+                            stacked_components(cross_components, cross_mask),
+                            stacked_components(local_components, scale_mask),
+                            stacked_components(far_components, scale_mask),
+                        )
+                        if self.training:
+                            component_beta = (
+                                self.lava_action_component_calibrator.update(
+                                    scale, component_families))
+                        else:
+                            component_beta = (
+                                self.lava_action_component_calibrator.beta(scale))
+
+                        def calibrate_family(raw_components, calibrated_components,
+                                             mask):
+                            for component_index, key in enumerate(
+                                    ("arm_state", "arm_change", "gripper_state",
+                                     "gripper_change")):
+                                calibrated_components[key][mask] = (
+                                    raw_components[key][mask]
+                                    / component_beta[component_index])
+
+                        calibrate_family(
+                            cross_components, calibrated_cross_components, cross_mask)
+                        calibrate_family(
+                            local_components, calibrated_local_components, scale_mask)
+                        calibrate_family(
+                            far_components, calibrated_far_components, scale_mask)
+
+                        def combined_distance(components, mask):
+                            return (
+                                self.lava_action_arm_state_weight
+                                * components["arm_state"][mask]
+                                + self.lava_action_arm_change_weight
+                                * components["arm_change"][mask]
+                                + self.lava_action_gripper_state_weight
+                                * components["gripper_state"][mask]
+                                + self.lava_action_gripper_change_weight
+                                * components["gripper_change"][mask])
+
+                        cross_distances[cross_mask] = combined_distance(
+                            calibrated_cross_components, cross_mask)
+                        local_distances[scale_mask] = combined_distance(
+                            calibrated_local_components, scale_mask)
+                        far_distances[scale_mask] = combined_distance(
+                            calibrated_far_components, scale_mask)
+                        for component_index, key in enumerate(
+                                ("arm_state", "arm_change", "gripper_state",
+                                 "gripper_change")):
+                            action_similarity_stats[
+                                f"action_component_beta_{key}_s{scale}"] = (
+                                    component_beta[component_index].item())
+
+                    cross_values = cross_distances[cross_mask]
                     cross_values = cross_values[torch.isfinite(cross_values)]
                     local_values = local_distances[scale_mask]
                     far_distance_values = far_distances[scale_mask]
@@ -1336,7 +1606,6 @@ class VLAModel(nn.Module):
                             distance, beta,
                             self.lava_action_similarity_min_weight)
 
-                    cross_mask = scale_mask[:, None] & cross_same_scale_mask
                     cross_weights[cross_mask] = gate(cross_distances[cross_mask])
                     local_weights[scale_mask] = gate(local_distances[scale_mask])
                     far_weights[scale_mask] = gate(far_distances[scale_mask])
@@ -1368,13 +1637,70 @@ class VLAModel(nn.Module):
                 action_similarity_stats["effective_negative_mass"] = (
                     cross_weights[cross_same_scale_mask].sum()
                     + local_weights.sum() + far_weights.sum()).item() / sample_count
-                for key, values in component_values.items():
+                for key, values in raw_component_values.items():
                     action_similarity_stats[
-                        {"arm": "arm_action_distance",
+                        {"arm_state": "arm_state_distance",
+                         "arm_change": "arm_change_distance",
                          "gripper_state": "gripper_state_distance",
                          "gripper_change": "gripper_change_distance",
-                         "combined": "combined_action_distance"}[key]] = (
-                            torch.stack(values).mean().item() if values else float("nan"))
+                         "combined": "raw_combined_action_distance"}[key]] = (
+                            torch.stack(values).mean().item()
+                            if values else float("nan"))
+                # Keep the V5 field as a compatibility alias for arm change.
+                action_similarity_stats["arm_action_distance"] = (
+                    action_similarity_stats["arm_change_distance"])
+
+                def collect_family_values(components, mask):
+                    return {
+                        key: values[mask]
+                        for key, values in components.items()
+                    }
+
+                calibrated_families = (
+                    collect_family_values(
+                        calibrated_cross_components, cross_same_scale_mask),
+                    collect_family_values(
+                        calibrated_local_components,
+                        torch.ones_like(local_distances, dtype=torch.bool)),
+                    collect_family_values(
+                        calibrated_far_components,
+                        torch.ones_like(far_distances, dtype=torch.bool)),
+                )
+                calibrated_all = {
+                    key: torch.cat([family[key] for family in calibrated_families])
+                    for key in ("arm_state", "arm_change", "gripper_state",
+                                "gripper_change")
+                }
+                contributions = {
+                    "arm_state": (self.lava_action_arm_state_weight
+                                  * calibrated_all["arm_state"]),
+                    "arm_change": (self.lava_action_arm_change_weight
+                                   * calibrated_all["arm_change"]),
+                    "gripper_state": (self.lava_action_gripper_state_weight
+                                      * calibrated_all["gripper_state"]),
+                    "gripper_change": (self.lava_action_gripper_change_weight
+                                       * calibrated_all["gripper_change"]),
+                }
+                combined_values = sum(contributions.values())
+                action_similarity_stats["combined_action_distance"] = (
+                    combined_values.mean().item())
+                for key in ("arm_state", "arm_change", "gripper_state",
+                            "gripper_change"):
+                    action_similarity_stats[
+                        f"calibrated_{key}_action_distance"] = (
+                            calibrated_all[key].mean().item())
+                    valid_combined = combined_values > 1e-12
+                    fraction = (
+                        contributions[key][valid_combined]
+                        / combined_values[valid_combined])
+                    action_similarity_stats[
+                        f"action_distance_{key}_contribution_fraction"] = (
+                            fraction.mean().item() if fraction.numel()
+                            else float("nan"))
+                # Keep the V5 calibrated-arm field as an arm-change alias.
+                action_similarity_stats["calibrated_arm_action_distance"] = (
+                    action_similarity_stats[
+                        "calibrated_arm_change_action_distance"])
                 for index, (task_name, scale) in enumerate(zip(
                         selected_task_names or ["unknown"] * sample_count, lengths)):
                     cross_mask = cross_same_scale_mask[index]
@@ -1382,23 +1708,38 @@ class VLAModel(nn.Module):
                     if cross_mask.any():
                         cross_audit = {
                             "distance": cross_distances[index, cross_mask].mean().item(),
+                            "raw_distance": raw_cross_distances[
+                                index, cross_mask].mean().item(),
                             "weight": cross_weights[index, cross_mask].mean().item(),
                             **{
                                 key: values[index, cross_mask].mean().item()
                                 for key, values in cross_components.items()
+                            },
+                            **{
+                                f"calibrated_{key}": values[
+                                    index, cross_mask].mean().item()
+                                for key, values in calibrated_cross_components.items()
                             },
                         }
                     action_similarity_audit.append({
                         "task": str(task_name), "scale": int(scale),
                         "cross": cross_audit,
                         "local": {"distance": local_distances[index].item(),
+                                  "raw_distance": raw_local_distances[index].item(),
                                   "weight": local_weights[index].item(),
                                   **{key: values[index].item()
-                                     for key, values in local_components.items()}},
+                                     for key, values in local_components.items()},
+                                  **{f"calibrated_{key}": values[index].item()
+                                     for key, values in
+                                     calibrated_local_components.items()}},
                         "far": {"distance": far_distances[index].item(),
+                                "raw_distance": raw_far_distances[index].item(),
                                 "weight": far_weights[index].item(),
                                 **{key: values[index].item()
-                                   for key, values in far_components.items()}},
+                                   for key, values in far_components.items()},
+                                **{f"calibrated_{key}": values[index].item()
+                                   for key, values in
+                                   calibrated_far_components.items()}},
                     })
 
                 # Preserve raw diagnostics while the optimization uses weighted logits.
@@ -1448,18 +1789,26 @@ class VLAModel(nn.Module):
                 })
 
             if negative_mode == "mixed":
-                # One family each for cross-task, local, far and order. The two
-                # order corruptions are log-mean-exp balanced above.
-                logits = torch.stack((
-                    positive_values,
-                    cross_task_family_values,
-                    weighted_temporal_values,
-                    weighted_far_values,
-                    order_family_values,
-                ), dim=1)
-                raw_logits = torch.stack((
-                    positive_values, raw_cross_task_family_values,
-                    temporal_values, far_values, order_family_values), dim=1)
+                if individual_batch_negatives:
+                    # Positive is column 0. Exclude self and other scales;
+                    # each remaining batch path contributes its own exp(logit/T).
+                    # Local/far and the existing pooled order candidate remain.
+                    logits = torch.cat((
+                        positive_values[:, None], batch_negative_values,
+                        temporal_values[:, None], far_values[:, None],
+                        order_family_values[:, None]), dim=1)
+                else:
+                    # Legacy four-family, optionally action-weighted objective.
+                    logits = torch.stack((
+                        positive_values,
+                        cross_task_family_values,
+                        weighted_temporal_values,
+                        weighted_far_values,
+                        order_family_values,
+                    ), dim=1)
+                    raw_logits = torch.stack((
+                        positive_values, raw_cross_task_family_values,
+                        temporal_values, far_values, order_family_values), dim=1)
             else:
                 logits = torch.stack(
                     (positive_values, temporal_values, order_family_values), dim=1)
@@ -1539,6 +1888,8 @@ class VLAModel(nn.Module):
 
         hardest_family_fractions = {
             "cross_task": float("nan"),
+            "same_task": float("nan"),
+            "batch": float("nan"),
             "local": float("nan"),
             "far": float("nan"),
             "order": float("nan"),
@@ -1560,6 +1911,24 @@ class VLAModel(nn.Module):
                 for index, name in enumerate(names):
                     hardest_family_fractions[name] = (
                         (hardest[has_negative] == index).float().mean().item())
+            if individual_batch_negatives:
+                # Report actual hardest individual candidates, rather than a
+                # family mean that no longer participates in this objective.
+                batch_hardest = batch_negative_values.max(dim=1).values
+                competitors = torch.stack((
+                    batch_hardest, temporal_values, far_values,
+                    order_family_values), dim=1)
+                average_candidate_count = (
+                    torch.isfinite(competitors).sum(dim=1).float().mean().item())
+                hardest = competitors.argmax(dim=1)
+                for index, name in enumerate(("batch", "local", "far", "order")):
+                    hardest_family_fractions[name] = (
+                        (hardest == index).float().mean().item())
+                batch_winner = batch_negative_values.argmax(dim=1)
+                rows = torch.arange(sample_count, device=device)
+                for name, mask in (("same_task", same_task), ("cross_task", cross_task)):
+                    hardest_family_fractions[name] = (
+                        ((hardest == 0) & mask[rows, batch_winner]).float().mean().item())
             if self.lava_action_similarity_weighting:
                 raw_negative_families = torch.stack((
                     raw_cross_task_family_values, temporal_values,
@@ -1578,7 +1947,12 @@ class VLAModel(nn.Module):
             raw_world = flat_world.float()
             world_residual = flat_world_residuals.float()
             action_residual = flat_action_residuals.float()
-            input_normalized_world = self.lava_world_encoder.input_norm(flat_world).float()
+            if state_mode:
+                normalized_paths = [self.lava_world_encoder.input_norm(path).float()
+                                    for path in positive_inputs]
+                input_normalized_world = torch.cat([path[1:] - path[:-1] for path in normalized_paths])
+            else:
+                input_normalized_world = self.lava_world_encoder.input_norm(flat_world).float()
 
             raw_transition_norm = raw_world.flatten(1).norm(dim=-1)
             input_norm_transition_norm = input_normalized_world.flatten(1).norm(dim=-1)
@@ -1620,7 +1994,7 @@ class VLAModel(nn.Module):
             world_l2_energy = torch.stack([
                 value["level2_energy_fraction"] for value in world_calibration
             ]).float()
-            order_eligible = interval_scales >= 2
+            order_eligible = interval_scales >= 4
 
             def eligible_mean(values):
                 return (values[order_eligible].mean().item()
@@ -1779,16 +2153,22 @@ class VLAModel(nn.Module):
                         action_l2_energy[scale_mask].mean().item())
                     diagnostics[f"world_logsig_l2_energy_fraction_s{scale}"] = (
                         world_l2_energy[scale_mask].mean().item())
-                    scale_index = self.lava_signature_calibrator.scale_to_index[scale]
-                    ema = self.lava_signature_calibrator.ema_squared_norm
-                    diagnostics[f"action_logsig_l1_ema_rms_s{scale}"] = (
-                        ema[0, 0, scale_index].sqrt().item())
-                    diagnostics[f"action_logsig_l2_ema_rms_s{scale}"] = (
-                        ema[0, 1, scale_index].sqrt().item())
-                    diagnostics[f"world_logsig_l1_ema_rms_s{scale}"] = (
-                        ema[1, 0, scale_index].sqrt().item())
-                    diagnostics[f"world_logsig_l2_ema_rms_s{scale}"] = (
-                        ema[1, 1, scale_index].sqrt().item())
+                    if self.lava_signature_calibrator is not None:
+                        scale_index = self.lava_signature_calibrator.scale_to_index[scale]
+                        ema = self.lava_signature_calibrator.ema_squared_norm
+                        diagnostics[f"action_logsig_l1_ema_rms_s{scale}"] = (
+                            ema[0, 0, scale_index].sqrt().item())
+                        diagnostics[f"action_logsig_l2_ema_rms_s{scale}"] = (
+                            ema[0, 1, scale_index].sqrt().item())
+                        diagnostics[f"world_logsig_l1_ema_rms_s{scale}"] = (
+                            ema[1, 0, scale_index].sqrt().item())
+                        diagnostics[f"world_logsig_l2_ema_rms_s{scale}"] = (
+                            ema[1, 1, scale_index].sqrt().item())
+                    else:
+                        diagnostics[f"action_logsig_l1_ema_rms_s{scale}"] = float("nan")
+                        diagnostics[f"action_logsig_l2_ema_rms_s{scale}"] = float("nan")
+                        diagnostics[f"world_logsig_l1_ema_rms_s{scale}"] = float("nan")
+                        diagnostics[f"world_logsig_l2_ema_rms_s{scale}"] = float("nan")
                 else:
                     diagnostics[f"action_logsig_l2_l1_ratio_s{scale}"] = float("nan")
                     diagnostics[f"world_logsig_l2_l1_ratio_s{scale}"] = float("nan")
@@ -1864,9 +2244,33 @@ class VLAModel(nn.Module):
             # not the number of corruption candidates inside the order family.
             "lava_order_negative_count": len(block_action_indices),
         })
+        if individual_batch_negatives:
+            batch_hardest = batch_negative_values.max(dim=1).values
+            batch_valid = torch.isfinite(batch_hardest)
+            batch_margin = (positive_values - batch_hardest).float().masked_fill(
+                ~batch_valid, torch.nan)
+            diagnostics.update({
+                "batch_candidate_count": batch_negative_mask.sum(dim=1).float().mean().item(),
+                "same_task_batch_candidate_count": (
+                    (batch_negative_mask & same_task).sum(dim=1).float().mean().item()),
+                "negative_candidate_count": (
+                    torch.isfinite(logits[:, 1:]).sum(dim=1).float().mean().item()),
+                "batch_margin": finite_mean(batch_margin).item(),
+                "batch_acc": finite_mean((batch_margin > 0).float().masked_fill(
+                    ~batch_valid, torch.nan)).item(),
+                "hardest_batch_fraction": hardest_family_fractions["batch"],
+                "hardest_same_task_fraction": hardest_family_fractions["same_task"],
+            })
         if self.lava_action_similarity_weighting:
             diagnostics.update(action_similarity_stats)
             diagnostics["_action_similarity_audit"] = action_similarity_audit
+        diagnostics.update({
+            "state_endpoint_error": state_endpoint_error,
+            "order_signature_distance": (torch.stack(order_distances).mean().item()
+                                         if order_distances else float("nan")),
+            "order_equivalent_fraction": ((torch.stack(order_distances) < 1e-5).float().mean().item()
+                                          if order_distances else float("nan")),
+        })
         return loss_lava, diagnostics
 
 
@@ -1887,6 +2291,9 @@ def calc_flow_matching_loss(
     use_future_feat=False,
     lambda_future_feat=0.5,
     # LAVA
+    world_feature_paths=None,
+    temporal_negative_feature_paths=None,
+    far_negative_feature_paths=None,
     world_feature_differences=None,
     temporal_negative_feature_differences=None,
     far_negative_feature_differences=None,
@@ -2019,9 +2426,12 @@ def calc_flow_matching_loss(
         "lava_sample_count": 0,
         "lava_order_negative_count": 0,
     }
-    if use_lava and world_feature_differences:
+    if use_lava and (world_feature_differences or world_feature_paths):
         loss_lava, lava_diagnostics = model.compute_lava_loss(
             action_hidden=preds["action_hidden"],
+            world_feature_paths=world_feature_paths,
+            temporal_negative_feature_paths=temporal_negative_feature_paths,
+            far_negative_feature_paths=far_negative_feature_paths,
             world_feature_differences=world_feature_differences,
             batch_indices=lava_batch_indices,
             interval_starts=lava_interval_starts,

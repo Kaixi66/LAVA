@@ -12,43 +12,37 @@ retained. LAVA is used only during training and adds no inference-time branch.
 
 ## Method
 
-For a sampled interval of length $L$, LAVA extracts frozen DINOv3 patch
-features from the same episode and constructs visual changes
+For a sampled interval of length $L$, LAVA V6 extracts frozen DINOv3 patch
+features for all $L+1$ frames. One shared Q-Former encodes each frame into
+8 ordered queries, each projected to 16 dimensions and flattened:
 
 $$
-\Delta Z_i = Z_{i+1} - Z_i.
+Y_i = \Phi(Z_i) \in \mathbb{R}^{128}, \qquad r_i^W = Y_{i+1} - Y_i.
 $$
 
-A learnable-query World Residual encoder compresses every patch-level change to
-a 32-dimensional residual. On the action side, LAVA V5 uses the final-normalized
-hidden state immediately before the linear action head and a shared MLP
-projector. The alignment
-is offset by one step:
+The shared action MLP projects final-normalized hidden states immediately
+before the action head into 128 dimensions. World increment $r_i^W$ aligns
+with $h_{i+1}$; $h_0$ is never used by LAVA.
 
-$$
-\Delta Z_i \longleftrightarrow h_{i+1},
-$$
+Both residual paths use a global differentiable depth-2 log-signature without
+a time channel. Raw first-level world signatures telescope to the state
+endpoint difference. Per-level normalization follows signature construction.
+The default `mixed_batch` objective uses
+every other same-scale world path in the batch as an individual negative,
+including same-task paths. Self-pairs and different-scale paths are excluded.
+Each batch candidate enters the InfoNCE denominator directly, with no family
+count averaging and no action-similarity weighting.
 
-so $h_0$ is never used by LAVA.
+Each anchor also retains a same-episode local path, a far path, and an order
+candidate. The order candidate is the log-mean-exp of a contiguous block swap
+and a full derangement, enabled only for $L\geq4$. Local, far, and order
+candidates are also unweighted. The legacy `mixed` objective remains available
+for reproducing older experiments; it is not the default training objective.
 
-Both residual paths receive a normalized time channel and are pooled with a
-differentiable depth-2 log-signature. LAVA V5 keeps four count-balanced negative
-families: cross-task same-scale paths from the current batch, a same-episode
-far path, a same-episode local path, and order corruptions. The order family
-contains a contiguous block swap and a full derangement; for $L=2$ their only
-unique permutation is included once.
-
-Cross-task, local, and far negatives are softened only when their detached,
-ground-truth action paths are similar. The descriptor combines normalized arm
-joint deltas with raw gripper state and gripper change. Order corruptions always
-retain weight 1. Each temporal scale has a family-balanced EMA distance scale:
-cross/local/far medians are computed separately and then averaged equally.
-
-The raw first- and second-level LogSignatures are calibrated by detached
-action/world-, level-, and scale-specific EMA RMS statistics. They are then
-concatenated with a fixed second-level weight of 0.5 and normalized once. This
-preserves weak-vs-strong order structure instead of forcing each path's two
-levels to unit norm independently.
+The default restores the V2/V3 block-wise normalization: first- and
+second-level LogSignatures are normalized independently, concatenated, and
+normalized once more. Every non-degenerate depth-2 path therefore assigns
+equal representation energy to endpoint displacement and temporal order.
 
 The training objective is
 
@@ -69,17 +63,18 @@ model:
     enabled: true
     action_target_layer: final
     dino_target_layer: -4
-    residual_dim: 32
+    world_encoding: state_delta
+    time_channel: false
+    residual_dim: 128
     qformer:
       hidden_dim: 256
-      num_queries: 1
+      num_queries: 8
+      query_dim: 16
       num_layers: 2
       num_heads: 4
     logsig_depth: 2
     signature_normalization:
-      type: ema_calibrated
-      ema_momentum: 0.99
-      level2_weight: 0.5
+      type: per_level_unit
 
 training:
   lambda_lava: 0.01
@@ -88,19 +83,14 @@ training:
   lava_sample_ratio: 0.125
   lava_scale_sampling: batch_uniform
   lava_sampling_balance: task_episode
-  lava_negative_mode: mixed
+  lava_negative_mode: mixed_batch
   lava_negative_window_multiplier: 4
   lava_negative_window_max: 32
   lava_warmup_ratio: 0.05
   lava_order_negative: true
   lava_grad_diagnostics_interval: 200
-  lava_action_similarity_weighting: true
-  lava_action_similarity_min_weight: 0.1
-  lava_action_similarity_beta_momentum: 0.99
-  lava_action_similarity_beta_multiplier: 1.0
-  lava_action_gripper_indices: [6, 13]
-  lava_action_gripper_state_weight: 0.5
-  lava_action_gripper_change_weight: 0.5
+  lava_action_similarity_weighting: false
+  lava_action_component_calibration: false
 ```
 
 `lava_sampling_balance: task_episode` keeps the base flow/future DataLoader
@@ -109,8 +99,8 @@ and then across episodes within each task. The provided RoboTwin Slurm scripts
 enable this mode explicitly and write an actual per-task sampling audit after
 every epoch.
 
-`mixed` mode uses `lava_sample_ratio: 0.125`, a local search radius
-$R(L)=\min(4L,32)$, and a far path outside that radius. Cross-task candidates
+`mixed_batch` mode uses `lava_sample_ratio: 0.125`, a local search radius
+$R(L)=\min(4L,32)$, and a far path outside that radius. Batch candidates
 reuse positive paths already encoded for the batch; order corruptions reuse
 the positive residual path and therefore require no extra DINO forward.
 
@@ -118,11 +108,20 @@ The fixed method choices are:
 
 - frozen DINOv3 targets from layer `-4`;
 - final-normalized hidden states before the action head;
-- visual differences `Z[t+1] - Z[t]`;
-- normalized time augmentation;
-- one-way Action-to-World mixed-family candidate contrast;
+- latent state differences `Phi(Z[t+1]) - Phi(Z[t])`;
+- 8 ordered 16-dimensional queries and no time channel;
+- one-way Action-to-World contrast with individual batch candidates;
 - a shared action projector across positions and scales;
 - no LAVA execution during policy inference.
+
+The active RoboTwin scripts use run name
+`robotwin10_lava_v6_1h100nvl`. They retain the V5.1 sampling
+ratio (0.125), batch-uniform scales, task/episode balancing, final action tap,
+and per-level normalization. CSV diagnostics add `Batch_Candidate_Count`,
+`Same_Task_Batch_Candidate_Count`, `Negative_Candidate_Count`, `Batch_Margin`,
+`Batch_Acc`, and hardest batch/same-task fractions. The negative candidate count
+counts the pooled order candidate once. Existing cross-task family metrics
+remain descriptive diagnostics; they do not define the new batch loss.
 
 ## Installation
 
@@ -212,7 +211,9 @@ Action/World_LogSig_L1/L2_Calibrated_Norm, L2_Energy_Fraction
 Loss_LAVA/Pos_Sim/Candidate_Acc/Local_Margin/Order_Margin_Executed/Tail
 Grad_Norm, Grad_Norm_LAVA_Branch
 Grad_Cos_Shared, Grad_Norm_Base/LAVA_Shared, Weighted_Grad_Ratio
-Arm/Gripper_State/Gripper_Change/Combined_Action_Distance
+Arm_State/Arm_Change/Gripper_State/Gripper_Change/Raw_Combined/Combined_Action_Distance
+Calibrated_Arm_State/Arm_Change/Gripper_State/Gripper_Change_Action_Distance
+Action_Component_Beta_*, Action_Distance_*_Contribution_Fraction
 CrossTask/Local/Far_Neg_Weight_Mean, Effective_Negative_Mass
 Raw/Weighted_CrossTask/Local/Far_Margin/Acc
 ```
@@ -221,7 +222,7 @@ Raw/Weighted_CrossTask/Local/Far_Margin/Acc
 block swap and a full derangement. Per-corruption metrics remain available in
 the CSV so the structured and destructive order tests can be studied
 separately.
-Scale 1 has no order negative. Shared-gradient diagnostics run every 200
+Scales 1 and 2 have no order negative. Shared-gradient diagnostics run every 200
 optimizer steps; their CSV fields are `nan` on non-diagnostic steps.
 
 ## Tests
@@ -258,3 +259,45 @@ this repository:
 
 The upstream paper and project page are available from the
 [official LiLa-WAM repository](https://github.com/teee000/LiLa-WAM).
+
+### LAVA V6
+
+`robotwin10_lava_v6_1h100nvl` encodes each frozen DINO frame with the same
+Q-Former (8 ordered queries, hidden size 256, two layers, four heads). A shared
+256→16 projection per query produces a flattened 128-dimensional state `Y_t`.
+The world increments are `Y_{t+1} - Y_t`; projection and subtraction use FP32
+under BF16 training. The action projector maps final action hidden states
+`h_{t+1}` to 128 dimensions. No query mean pooling or time channel is used.
+The global depth-2 LogSignature contains 8,256 coordinates, including
+cross-query areas. Its raw first level telescopes to the endpoint difference;
+per-level normalization is applied only after signature construction.
+
+V5.2 negatives are retained: unweighted individual same-scale batch candidates
+(including same-task paths), paired local/far paths, and pooled block-swap /
+derangement negatives for L≥4. Lambda=0.01 and sampling ratio=0.125 are unchanged.
+`state_endpoint_error`, `order_signature_distance`, and
+`order_equivalent_fraction` (normalized signature distance <1e-5) monitor the
+state identity and degenerate order negatives without filtering candidates.
+Old configs default to feature-delta encoding, mean pooling, and a time channel.
+
+The requested run is Stage 1 for 12 epochs on one H100 NVL, followed by the
+Stage-1 epoch-12 evaluation on one L40S using an `afterok` dependency.
+
+### Dataset validity fix (2026-09-09)
+
+The original V5.2 job 7479255 (54,288 logged steps) and V6 job 7479456
+(27,144 logged steps) never received LAVA supervision. With action weighting
+disabled, negative action paths were not requested, but `__getitem__` still
+read them. Its broad exception handler recursively resampled and silently
+discarded every LAVA example. Their checkpoints and evaluations are invalid
+as LAVA results; originals are preserved under
+`runs/LAVA/invalid_runs/20260909_103505` in the workspace, outside auto-resume paths.
+
+Negative actions are now read only when action weighting is enabled. Dataset
+errors and missing requested evolution frames raise immediately with episode
+context. `LAVAHealthMonitor` verifies batch-to-loss sample counts, finite loss,
+and autograd connectivity; it stops after 100 consecutive unsupervised batches
+(configurable through `training.lava_max_empty_batches`). HDF5 and multiworker
+regressions cover weighted/unweighted local, mixed, and mixed-batch paths at
+all five temporal scales. Production-shaped GPU validation additionally runs
+real data through frozen DINO, the full policy and LAVA backward before restart.

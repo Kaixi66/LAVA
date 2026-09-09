@@ -185,7 +185,7 @@ class RobotWinTaskDataset(data.Dataset):
                                    "task_episode" also equalizes episodes within each task
             lava_negative_mode: "batch" uses the legacy batch-wide denominator;
                                 "episode_local" adds one same-episode local negative;
-                                "mixed" adds local and far same-episode negatives
+                                "mixed" / "mixed_batch" add local and far same-episode negatives
             lava_negative_window_multiplier: local negative search radius in units of L
             lava_negative_window_max: maximum local negative search radius in frames
         """
@@ -259,10 +259,10 @@ class RobotWinTaskDataset(data.Dataset):
                 raise ValueError(
                     "lava_sampling_balance must be one of 'none', 'task', or "
                     f"'task_episode', got {self.lava_sampling_balance}")
-            if self.lava_negative_mode not in {"batch", "episode_local", "mixed"}:
+            if self.lava_negative_mode not in {"batch", "episode_local", "mixed", "mixed_batch"}:
                 raise ValueError(
-                    "lava_negative_mode must be 'batch', 'episode_local', or "
-                    "'mixed', got "
+                    "lava_negative_mode must be 'batch', 'episode_local', "
+                    "'mixed', or 'mixed_batch', got "
                     f"{self.lava_negative_mode}")
             if self.lava_negative_window_multiplier < 1:
                 raise ValueError("lava_negative_window_multiplier must be >= 1")
@@ -544,12 +544,12 @@ class RobotWinTaskDataset(data.Dataset):
             positive_abs_start, scale, total_frames)
         far_negative_abs_start = None
         negative_mode = getattr(self, "lava_negative_mode", "episode_local")
-        if negative_mode == "mixed":
+        if negative_mode in {"mixed", "mixed_batch"}:
             far_negative_abs_start = self._sample_far_negative_start(
                 positive_abs_start, scale, total_frames,
                 exclude_starts=(negative_abs_start,))
         if (negative_abs_start is None
-                or (negative_mode == "mixed"
+                or (negative_mode in {"mixed", "mixed_batch"}
                     and far_negative_abs_start is None)):
             return {
                 'dropped': True,
@@ -829,7 +829,7 @@ class RobotWinTaskDataset(data.Dataset):
             lava_pair_dropped = False
             lava_interval = None
             lava_pair = None
-            if self.lava_negative_mode in {'episode_local', 'mixed'}:
+            if self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
                 lava_pair = self._sample_lava_contrastive_pair(
                     local_anchor_idx, total_frames, episode_idx=ep_idx,
                     forced_scale=forced_scale)
@@ -877,6 +877,9 @@ class RobotWinTaskDataset(data.Dataset):
                 ]
 
             data_batch = self._load_hdf5_data(ep_meta['hdf5_path'], query_indices)
+            for key in ('evolution_frames', 'temporal_negative_frames', 'far_negative_frames'):
+                if key in query_indices and key not in data_batch:
+                    raise KeyError(f'Requested LAVA frames missing from loader: {key}')
             data_batch.update(padding_mask)
 
             # Primary camera -> ImageNet-normalized pixel_values
@@ -942,8 +945,9 @@ class RobotWinTaskDataset(data.Dataset):
                         negative_normed).float()
                     result['temporal_negative_distance'] = int(
                         lava_pair['negative_distance'])
-                    result['temporal_negative_actions'] = data_batch[
-                        'temporal_negative_actions']
+                    if self.lava_action_similarity_weighting:
+                        result['temporal_negative_actions'] = data_batch[
+                            'temporal_negative_actions']
                     result['temporal_negative_local_fallback'] = bool(
                         lava_pair['used_global_fallback'])
                     if 'far_negative_frames' in data_batch:
@@ -954,8 +958,9 @@ class RobotWinTaskDataset(data.Dataset):
                             far_negative_normed).float()
                         result['far_negative_distance'] = int(
                             lava_pair['far_negative_distance'])
-                        result['far_negative_actions'] = data_batch[
-                            'far_negative_actions']
+                        if self.lava_action_similarity_weighting:
+                            result['far_negative_actions'] = data_batch[
+                                'far_negative_actions']
 
             # Task condition vector (looked up by the episode's task_name)
             if self.use_task_cond:
@@ -965,10 +970,12 @@ class RobotWinTaskDataset(data.Dataset):
             return result
 
         except Exception as e:
-            logger.warning(f"Error loading idx {idx}: {e}")
-            retry_index = random.randint(0, len(self) - 1)
-            return self.__getitem__((retry_index, forced_scale)
-                                    if forced_scale is not None else retry_index)
+            # Never change the sampling distribution to hide a programming or
+            # data error. In particular, retrying could discard every LAVA path.
+            raise RuntimeError(
+                f"Failed loading idx={idx}, episode={ep_meta['hdf5_path']}, "
+                f"forced_scale={forced_scale}: {e}") from e
+
 
 
 def create_dataset(config: Any, val: bool = False):
