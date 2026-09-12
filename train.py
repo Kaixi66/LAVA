@@ -55,6 +55,10 @@ class LossLogger:
         ("Retrieval_Acc", "retrieval_acc", ".6f"),
         ("Action_Pair_Sim", "action_pair_sim", ".6f"),
         ("World_Pair_Sim", "world_pair_sim", ".6f"),
+        ("FiLM_Gamma_RMS", "film_gamma_rms", ".8f"),
+        ("FiLM_Beta_RMS", "film_beta_rms", ".8f"),
+        ("FiLM_Context_Count", "film_context_count", "d"),
+        ("FiLM_Grad_Norm", "film_grad_norm", ".8f"),
         ("Same_Task_Neg_Sim", "same_task_negative_sim", ".6f"),
         ("Cross_Task_Neg_Sim", "cross_task_negative_sim", ".6f"),
         ("Task_Shortcut_Gap", "task_shortcut_gap", ".6f"),
@@ -183,6 +187,8 @@ class LossLogger:
         ("Action_Residual_Norm", "action_residual_norm", ".6f"),
         ("Action_Residual_Std", "action_residual_std", ".6f"),
         # Raw and EMA-calibrated LogSig geometry
+        ("Signature_EMA_RMS_Min", "signature_ema_rms_min", ".8e"),
+        ("Signature_EMA_RMS_Max", "signature_ema_rms_max", ".8e"),
         ("Action_LogSig_L1_Raw_Norm", "action_logsig_l1_raw_norm", ".6f"),
         ("Action_LogSig_L2_Raw_Norm", "action_logsig_l2_raw_norm", ".6f"),
         ("Action_LogSig_L2_L1_Ratio", "action_logsig_l2_l1_ratio", ".6f"),
@@ -997,6 +1003,10 @@ if __name__ == "__main__":
     ]
     if use_lava and not lava_branch_parameters:
         raise RuntimeError("LAVA is enabled but no lava_* trainable parameters were found")
+    film_parameters = [
+        parameter for name, parameter in action_model.named_parameters()
+        if name.startswith("lava_world_encoder.film.")
+    ]
     lava_gradient_parameter_groups = build_lava_gradient_parameter_groups(action_model)
 
     lava_warmup_steps = int(round(total_optimizer_steps * lava_warmup_ratio))
@@ -1202,6 +1212,11 @@ if __name__ == "__main__":
                     f"Non-finite training loss at epoch={epoch + 1}, step={step + 1}: {info_dic}")
 
             loss.backward()
+            if film_parameters and info_dic.get('lava_sample_count', 0):
+                if info_dic.get('film_context_count') != info_dic['lava_sample_count']:
+                    raise RuntimeError("FiLM context coverage does not match LAVA supervision")
+                if any(parameter.grad is None for parameter in film_parameters):
+                    raise RuntimeError("FiLM is disconnected from the training loss")
 
             qformer_snapshot = None
             action_projector_snapshot = None
@@ -1226,6 +1241,7 @@ if __name__ == "__main__":
 
             if (step + 1) % grad_accum_steps == 0:
                 lava_branch_grad_norm = parameter_grad_norm(lava_branch_parameters)
+                film_grad_norm = parameter_grad_norm(film_parameters)
                 grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
                     action_model.parameters(), max_norm=grad_clip_norm)
                 grad_norm = float(grad_norm_tensor.detach().float().item())
@@ -1278,6 +1294,7 @@ if __name__ == "__main__":
                     'qformer_learning_rate': current_qformer_lr,
                     'grad_norm': grad_norm,
                     'lava_branch_grad_norm': lava_branch_grad_norm,
+                    'film_grad_norm': film_grad_norm,
                     **grad_diagnostics,
                     'update_time_s': time.time() - update_window_start,
                     'data_time_s': update_window_data_time,

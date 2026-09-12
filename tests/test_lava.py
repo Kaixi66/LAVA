@@ -1182,10 +1182,12 @@ def test_v6_state_queries_and_telescoping(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_v6_mixed_paths_no_time_and_backward(dtype, monkeypatch):
+@pytest.mark.parametrize("time_channel", [False, True])
+def test_v6_mixed_paths_time_channel_and_backward(dtype, time_channel, monkeypatch):
     import models.vla_model_fm as module
     torch.manual_seed(62)
     model = _small_v6_model().to(dtype=dtype)
+    model.lava_time_channel = time_channel
     # Two samples per scale exercise same-scale and same-task batch negatives.
     scales = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16]
     groups = [[torch.randn(length + 1, 5, 16) for length in scales] for _ in range(3)]
@@ -1193,10 +1195,13 @@ def test_v6_mixed_paths_no_time_and_backward(dtype, monkeypatch):
     observed = []
     original = module._raw_logsignature_levels
     def capture(increments):
-        assert increments.shape[1] == 128
+        assert increments.shape[1] == 128 + int(time_channel)
+        if time_channel:
+            torch.testing.assert_close(increments[:, -1], torch.full_like(increments[:, -1], 1. / len(increments)))
+            torch.testing.assert_close(increments[:, -1].sum(), increments.new_tensor(1.))
         levels = original(increments)
         assert all(level.dtype == torch.float32 for level in levels)
-        assert sum(level.numel() for level in levels) == 8256
+        assert sum(level.numel() for level in levels) == (8385 if time_channel else 8256)
         observed.append(increments.shape[0])
         return levels
     monkeypatch.setattr(module, '_raw_logsignature_levels', capture)
@@ -1301,3 +1306,14 @@ def test_v6_config_factory_and_legacy_defaults():
     assert legacy.lava_world_encoding == 'feature_delta' and legacy.lava_time_channel
     assert legacy.lava_world_encoder.output_proj.weight.shape == (32, 256)
     legacy.load_state_dict(legacy.state_dict(), strict=True)
+
+
+def test_v61_config_only_restores_time():
+    from omegaconf import OmegaConf
+    configs = Path(__file__).parents[1] / 'configs'
+    v6 = OmegaConf.load(configs / 'robotwin_all.yaml')
+    v61 = OmegaConf.load(configs / 'robotwin_lava_v61.yaml')
+    assert not v6.model.lava.time_channel
+    assert v61.model.lava.time_channel
+    v61.model.lava.time_channel = False
+    assert OmegaConf.to_container(v6) == OmegaConf.to_container(v61)

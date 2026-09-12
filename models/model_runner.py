@@ -89,6 +89,9 @@ class ModelFactory:
         lava_cfg = model_cfg.get('lava', {})
         use_lava = bool(lava_cfg.get('enabled', False)) if lava_cfg else False
         qformer_cfg = lava_cfg.get('qformer', {}) if lava_cfg else {}
+        world_condition_cfg = lava_cfg.get('world_condition', {}) if lava_cfg else {}
+        world_condition = (world_condition_cfg.get('type', 'query_film')
+                           if world_condition_cfg.get('enabled', False) else 'none')
         signature_norm_cfg = lava_cfg.get('signature_normalization', {}) \
             if lava_cfg else {}
         signature_norm_type = (
@@ -141,6 +144,7 @@ class ModelFactory:
             lava_dino_feat_dim=dino_hidden_size,
             lava_world_encoding=lava_cfg.get('world_encoding', 'feature_delta'),
             lava_time_channel=lava_cfg.get('time_channel', True),
+            lava_world_condition=world_condition,
             lava_query_dim=qformer_cfg.get('query_dim', 16),
             lava_residual_dim=lava_cfg.get('residual_dim', 32) if lava_cfg else 32,
             lava_qformer_hidden_dim=qformer_cfg.get('hidden_dim', 256) if qformer_cfg else 256,
@@ -158,6 +162,8 @@ class ModelFactory:
                 'level2_weight', 0.5) if signature_norm_cfg else 0.5,
             lava_action_similarity_weighting=bool(config.training.get(
                 'lava_action_similarity_weighting', False)),
+            lava_batch_negative_reduction=config.training.get(
+                'lava_batch_negative_reduction', 'sum'),
             lava_action_component_calibration=bool(config.training.get(
                 'lava_action_component_calibration', False)),
             lava_action_similarity_min_weight=float(config.training.get(
@@ -299,7 +305,7 @@ class VLAWrapper(nn.Module):
         logger.info(f"Loaded State stats - Dim: {len(state_stats['min'])}")
 
     @torch.no_grad()
-    def get_vision_features(self, pixel_values):
+    def get_vision_features(self, pixel_values, return_lava_context=False):
         """
         Extract DINOv3 multi-layer hidden states.
 
@@ -326,6 +332,7 @@ class VLAWrapper(nn.Module):
         pixel_values = pixel_values.to(self.device, self.dtype)
         encode_bs = self.vision_encode_batch_size or pixel_values.shape[0]
         hidden_chunks = None
+        context_chunks = []
         for chunk in pixel_values.split(encode_bs, dim=0):
             outputs = self.vision_encoder(
                 pixel_values=chunk,
@@ -336,6 +343,11 @@ class VLAWrapper(nn.Module):
                 hidden_chunks = [[] for _ in self.feat_layers]
             for out_idx, layer_idx in enumerate(self.feat_layers):
                 hidden_chunks[out_idx].append(outputs.hidden_states[layer_idx])
+            if return_lava_context:
+                # Reuse this current-observation DINO forward, patches only.
+                patches = outputs.hidden_states[self.lava_target_layer][
+                    :, 1 + self.num_register_tokens:, :]
+                context_chunks.append(patches.mean(dim=1))
         # hidden_states is a tuple of length num_hidden_layers + 1:
         # [0] is the embedding output, [1..num_layers] are the transformer block outputs
         # feat_layer = -1 -> last layer
@@ -348,6 +360,12 @@ class VLAWrapper(nn.Module):
             if num_cameras is not None:
                 h = h.reshape(batch_size, num_cameras * h.shape[1], h.shape[2])
             feats_list.append(h)
+        if return_lava_context:
+            context = torch.cat(context_chunks, dim=0)
+            if num_cameras is not None:
+                # Evolution paths use the primary camera (camera_names[0]).
+                context = context.reshape(batch_size, num_cameras, -1)[:, 0, :]
+            return feats_list, context
         return feats_list
 
     @torch.no_grad()
@@ -437,7 +455,12 @@ class VLAWrapper(nn.Module):
         """Forward pass and loss computation"""
         # 1. Vision features (multi-layer DINO)
         pixel_values = batch['pixel_values']      # (B, 3, H, W)
-        dino_features_list = self.get_vision_features(pixel_values)
+        lava_context = None
+        if self.use_lava and getattr(self.action_model, 'lava_world_condition', 'none') == 'query_film':
+            dino_features_list, lava_context = self.get_vision_features(
+                pixel_values, return_lava_context=True)
+        else:
+            dino_features_list = self.get_vision_features(pixel_values)
 
         # 2. Action / State preparation
         x1_raw = batch['action_sequence'].to(self.device, self.dtype)
@@ -568,6 +591,7 @@ class VLAWrapper(nn.Module):
             temporal_negative_feature_paths=local_features if state_mode else None,
             far_negative_feature_paths=far_features if state_mode else None,
             lava_batch_indices=batch.get('evolution_batch_indices'),
+            lava_context=lava_context,
             lava_interval_starts=batch.get('evolution_starts'),
             lava_interval_scales=batch.get('evolution_scales'),
             use_lava=self.use_lava,

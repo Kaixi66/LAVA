@@ -301,3 +301,43 @@ and autograd connectivity; it stops after 100 consecutive unsupervised batches
 regressions cover weighted/unweighted local, mixed, and mixed-batch paths at
 all five temporal scales. Production-shaped GPU validation additionally runs
 real data through frozen DINO, the full policy and LAVA backward before restart.
+
+### LAVA V6.1
+
+`configs/robotwin_lava_v61.yaml` restores a normalized time increment `1/L`
+on both action and world paths, including positive, local, far, and order
+candidates. All other V6 settings are retained: 8×16 state queries, encode
+frames before subtracting, and unweighted mixed-batch negatives. The augmented
+increment dimension is 129 and the global depth-2 signature dimension is
+8,385. Spatial increments still telescope to the latent endpoint difference.
+
+Submit `Kaixi_scripts/LAVA/train/stage1/train_robotwin_lava_v61_stage1_1_h100_nvl.sbatch`
+from the workspace using sbatch. Run name: `robotwin10_lava_v6.1_1h100nvl`;
+Stage1, 12 epochs, batch128, seed42, one H100 NVL.
+
+### LAVA V6.2 and V6.3
+
+V6.2 (`configs/robotwin_lava_v62.yaml`) conditions the shared world-state
+queries on the current policy observation with zero-initialized FiLM. Every
+frame and candidate for an action anchor uses that anchor's context; batch
+candidates are recomputed under the row anchor's context with activation
+checkpointing.
+
+V6.3 (`configs/robotwin_lava_v63.yaml`) retains that architecture, removes the
+time channel, and replaces per-level unit normalization with positive-path
+EMA energy soft normalization:
+
+```text
+v <- 0.99 * v + 0.01 * mean_positive_paths(||S||^2)
+normalized_S = S / sqrt(||S||^2 + stop_gradient(v))
+```
+
+Statistics are separate for each modality, level and scale, remain FP32, and
+are shared by all candidates within a forward pass. The concatenated spatial
+signature has 8,256 dimensions and uses fixed equal-level scaling without a
+final unit normalization. Batch/local/far negatives and order negatives at
+L>=4 are retained; action similarity weighting remains disabled.
+
+The experiment trains from scratch for 12 epochs with batch128 and seed42.
+See [V6.3 design, training command and validation](docs/lava_v63.md), including
+the archived H100 NVL training and L40S evaluation submission scripts.

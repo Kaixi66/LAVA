@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def get_1d_sincos_pos_embed(embed_dim, length):
@@ -172,7 +173,8 @@ class WorldResidualEncoder(nn.Module):
     """Encode DINO patches; legacy pooled residuals or ordered per-frame state queries."""
 
     def __init__(self, feat_dim, residual_dim, hidden_dim=256,
-                 num_queries=1, num_layers=2, num_heads=4, query_dim=None):
+                 num_queries=1, num_layers=2, num_heads=4, query_dim=None,
+                 use_query_film=False):
         super().__init__()
         self.num_queries = num_queries
         self.query_dim = query_dim
@@ -195,12 +197,28 @@ class WorldResidualEncoder(nn.Module):
         self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, residual_dim if query_dim is None else query_dim)
+        self.use_query_film = bool(use_query_film)
+        if self.use_query_film:
+            # Module construction happens on CPU. Do not shift initialization
+            # of the existing action projector when enabling a zero-init FiLM.
+            with torch.random.fork_rng(devices=[]):
+                self.context_norm = nn.LayerNorm(feat_dim)
+                self.film = nn.Linear(feat_dim, 2 * hidden_dim)
+                nn.init.zeros_(self.film.weight)
+                nn.init.zeros_(self.film.bias)
 
-    def forward(self, feature_differences):
+    def forward(self, feature_differences, context=None):
         """Input is (B, patches, dino_dim): frame states in V6, differences in legacy mode."""
         batch_size = feature_differences.shape[0]
         memory = self.input_proj(self.input_norm(feature_differences))
         queries = self.query_embed.expand(batch_size, -1, -1)
+        if self.use_query_film:
+            if context is None or context.shape != (batch_size, feature_differences.shape[-1]):
+                raise ValueError("query_film requires one current-frame context per encoded frame")
+            gamma, beta = self.film(self.context_norm(context)).chunk(2, dim=-1)
+            queries = queries * (1.0 + gamma[:, None, :]) + beta[:, None, :]
+        elif context is not None:
+            raise ValueError("Context supplied to an unconditional world encoder")
         residual_queries = self.decoder(queries, memory)
         state_queries = self.output_norm(residual_queries)
         if self.query_dim is None:
@@ -398,6 +416,81 @@ class EMALogSignatureCalibrator(nn.Module):
             "level1_ema_rms": level_one_rms.detach(),
             "level2_ema_rms": level_two_rms.detach(),
         }
+
+
+class EMASoftLogSignatureNormalizer(EMALogSignatureCalibrator):
+    """V6.3: positive-population RMS with smooth, bounded level features.
+
+    A zero first batch decays the unit initial reference instead of replacing
+    it with epsilon. Individual zero paths retain finite derivatives. There is
+    deliberately no final unit normalization of the concatenated signature.
+    """
+
+    def __init__(self, scales=(1, 2, 4, 8, 16), momentum=0.99):
+        super().__init__(scales=scales, momentum=momentum, level2_weight=1.0)
+
+    def _apply(self, fn, recurse=True):
+        # model.to(bfloat16) must not quantize accumulated population energy.
+        original_energy = self.ema_squared_norm
+        result = super()._apply(fn, recurse=recurse)
+        self.ema_squared_norm = original_energy.to(
+            device=self.ema_squared_norm.device, dtype=torch.float32)
+        return result
+
+    @torch.no_grad()
+    def update(self, modality, level_ones, level_twos, scales):
+        if not (len(level_ones) == len(level_twos) == len(scales)):
+            raise ValueError("Calibration inputs must have matching lengths")
+        for scale in sorted(set(int(value) for value in scales)):
+            modality_index, scale_index = self._indices(modality, scale)
+            selected = [i for i, value in enumerate(scales) if int(value) == scale]
+            groups = (level_ones,) if scale == 1 else (level_ones, level_twos)
+            with torch.autocast(device_type=self.ema_squared_norm.device.type,
+                                enabled=False):
+                energies = torch.stack([
+                    torch.stack([group[i].detach().float() for i in selected])
+                    .square().sum(dim=-1).mean() for group in groups])
+                reference = self.ema_squared_norm[modality_index, :len(groups), scale_index]
+                updated = reference * self.momentum + energies * (1.0 - self.momentum)
+                if not bool((torch.isfinite(updated) & (updated > 0)).all()):
+                    raise FloatingPointError(
+                        f"Degenerate EMA LogSig energy: modality={modality}, scale={scale}")
+                reference.copy_(updated)
+                self.ema_initialized[modality_index, :len(groups), scale_index] = True
+
+    def forward(self, level_one, level_two, modality, scale, depth=2, reference=None):
+        if depth not in (1, 2):
+            raise ValueError(f"LAVA supports logsig_depth 1 or 2, got {depth}")
+        modality_index, scale_index = self._indices(modality, scale)
+        with torch.autocast(device_type=level_one.device.type, enabled=False):
+            # clone isolates this graph's reference even if another forward
+            # updates the buffer before its backward pass.
+            population = self.ema_squared_norm if reference is None else reference
+            energy = population[modality_index, :, scale_index].detach().clone()
+            one = level_one.float()
+            one = one / (one.square().sum() + energy[0]).sqrt()
+            two = torch.zeros_like(level_two, dtype=torch.float32)
+            two_rms = one.new_tensor(float("nan"))
+            if depth == 2 and int(scale) >= 2:
+                two = level_two.float()
+                two = two / (two.square().sum() + energy[1]).sqrt()
+                two_rms = energy[1].sqrt()
+            if depth == 1:
+                signature = one
+            else:
+                signature = torch.cat((one, two), dim=0)
+                if int(scale) >= 2:
+                    signature = signature / (2.0 ** 0.5)
+            one_energy = one.detach().square().sum()
+            two_energy = two.detach().square().sum()
+            return signature, {
+                "level1_calibrated_norm": one.detach().norm(),
+                "level2_calibrated_norm": two.detach().norm(),
+                "level2_energy_fraction": (
+                    two_energy / (one_energy + two_energy).clamp_min(self.eps ** 2)),
+                "level1_ema_rms": energy[0].sqrt(),
+                "level2_ema_rms": two_rms,
+            }
 
 
 class EMAActionDistanceCalibrator(nn.Module):
@@ -651,6 +744,7 @@ class VLAModel(nn.Module):
                  lava_residual_dim=32,
                  lava_world_encoding="feature_delta",
                  lava_time_channel=True,
+                 lava_world_condition="none",
                  lava_query_dim=16,
                  lava_qformer_hidden_dim=256,
                  lava_qformer_num_queries=1,
@@ -663,6 +757,7 @@ class VLAModel(nn.Module):
                  lava_signature_ema_momentum=0.99,
                  lava_signature_level2_weight=0.5,
                  lava_action_similarity_weighting=False,
+                 lava_batch_negative_reduction="sum",
                  lava_action_component_calibration=False,
                  lava_action_similarity_min_weight=0.1,
                  lava_action_similarity_beta_momentum=0.99,
@@ -691,17 +786,25 @@ class VLAModel(nn.Module):
         if self.lava_world_encoding not in {"feature_delta", "state_delta"}:
             raise ValueError("lava_world_encoding must be feature_delta or state_delta")
         self.lava_time_channel = bool(lava_time_channel)
+        self.lava_world_condition = str(lava_world_condition)
+        if self.lava_world_condition not in {"none", "query_film"}:
+            raise ValueError("lava_world_condition must be none or query_film")
+        if self.lava_world_condition == "query_film" and self.lava_world_encoding != "state_delta":
+            raise ValueError("query_film requires state_delta world encoding")
         self.lava_residual_dim = lava_residual_dim
         self.lava_logsig_depth = lava_logsig_depth
         self.lava_signature_normalization = str(
             lava_signature_normalization).lower()
         if self.lava_signature_normalization not in {
-                "per_level_unit", "ema_calibrated"}:
+                "per_level_unit", "ema_calibrated", "ema_rms_soft"}:
             raise ValueError(
-                "lava_signature_normalization must be per_level_unit or "
-                f"ema_calibrated, got {self.lava_signature_normalization}")
+                "lava_signature_normalization must be per_level_unit, "
+                f"ema_calibrated or ema_rms_soft, got {self.lava_signature_normalization}")
         self.lava_action_similarity_weighting = bool(
             lava_action_similarity_weighting)
+        self.lava_batch_negative_reduction = str(lava_batch_negative_reduction)
+        if self.lava_batch_negative_reduction not in {"sum", "mean"}:
+            raise ValueError("lava_batch_negative_reduction must be sum or mean")
         self.lava_action_component_calibration = bool(
             lava_action_component_calibration)
         self.lava_action_similarity_min_weight = float(
@@ -851,6 +954,7 @@ class VLAModel(nn.Module):
                 num_queries=lava_qformer_num_queries,
                 num_layers=lava_qformer_num_layers,
                 num_heads=lava_qformer_num_heads,
+                use_query_film=(self.lava_world_condition == "query_film"),
             )
             # Shared across action positions and temporal scales by design.
             self.lava_action_projector = nn.Sequential(
@@ -865,6 +969,9 @@ class VLAModel(nn.Module):
                     momentum=lava_signature_ema_momentum,
                     level2_weight=lava_signature_level2_weight,
                 )
+            elif self.lava_signature_normalization == "ema_rms_soft":
+                self.lava_signature_calibrator = EMASoftLogSignatureNormalizer(
+                    scales=lava_scales, momentum=lava_signature_ema_momentum)
             else:
                 # V2/V3 behavior: each non-zero LogSig level is normalized
                 # independently before concatenation. Keeping no calibrator
@@ -1002,7 +1109,8 @@ class VLAModel(nn.Module):
                           far_negative_raw_actions=None,
                           world_feature_paths=None,
                           temporal_negative_feature_paths=None,
-                          far_negative_feature_paths=None):
+                          far_negative_feature_paths=None,
+                          lava_context=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -1010,6 +1118,8 @@ class VLAModel(nn.Module):
         # the same local/far sampler but exposes every same-scale batch path as
         # an individual, unweighted candidate (including same-task paths).
         individual_batch_negatives = negative_mode == "mixed_batch"
+        if self.lava_batch_negative_reduction == "mean" and not individual_batch_negatives:
+            raise ValueError("batch negative mean reduction requires mixed_batch")
         if individual_batch_negatives:
             if self.lava_action_similarity_weighting:
                 raise ValueError("mixed_batch requires action-similarity weighting disabled")
@@ -1100,6 +1210,14 @@ class VLAModel(nn.Module):
             raise ValueError("LAVA batch metadata and feature-difference counts do not match")
 
         lengths = [int(scale) for scale in interval_scales.tolist()]
+        conditioned = self.lava_world_condition == "query_film"
+        selected_contexts = None
+        if conditioned:
+            if not individual_batch_negatives:
+                raise ValueError("query_film currently requires mixed_batch negatives")
+            if lava_context is None or lava_context.ndim != 2 or lava_context.shape[0] != action_hidden.shape[0]:
+                raise ValueError("query_film requires current-observation context for the policy batch")
+            selected_contexts = lava_context.to(action_hidden.device)[batch_indices]
         groups = [world_inputs]
         if local_inputs is not None:
             groups.append(local_inputs)
@@ -1112,7 +1230,16 @@ class VLAModel(nn.Module):
                 if path.shape[0] != expected:
                     raise ValueError(f"LAVA feature path length {path.shape[0]} != {expected}")
                 paths.append(path.to(action_hidden.device, dtype=action_hidden.dtype))
-        encoded = self.lava_world_encoder(torch.cat(paths, dim=0))
+        flat_frames = torch.cat(paths, dim=0)
+        if conditioned:
+            flat_contexts = torch.cat([
+                context[None, :].expand(length, -1)
+                for _ in groups
+                for context, length in zip(selected_contexts, input_lengths)
+            ], dim=0)
+            encoded = self.lava_world_encoder(flat_frames, context=flat_contexts)
+        else:
+            encoded = self.lava_world_encoder(flat_frames)
         encoded_paths = list(encoded.split(input_lengths * len(groups), dim=0))
         residual_paths = ([path[1:] - path[:-1] for path in encoded_paths]
                           if state_mode else encoded_paths)
@@ -1189,7 +1316,16 @@ class VLAModel(nn.Module):
                 "world", [value[0] for value in world_raw_levels],
                 [value[1] for value in world_raw_levels], lengths)
 
+        soft_reference = (
+            self.lava_signature_calibrator.ema_squared_norm.detach().clone()
+            if isinstance(self.lava_signature_calibrator, EMASoftLogSignatureNormalizer)
+            else None)
+
         def build_signature(levels, modality, scale):
+            if soft_reference is not None:
+                return self.lava_signature_calibrator(
+                    *levels, modality, scale, depth=self.lava_logsig_depth,
+                    reference=soft_reference)
             if self.lava_signature_calibrator is not None:
                 return self.lava_signature_calibrator(
                     *levels, modality, scale, depth=self.lava_logsig_depth)
@@ -1297,7 +1433,35 @@ class VLAModel(nn.Module):
         candidate_correct_per_sample = torch.full(
             (sample_count,), torch.nan, device=device, dtype=torch.float32)
 
-        positive_world_logits = action_signatures @ world_signatures.transpose(0, 1)
+        if conditioned:
+            # Every candidate is interpreted using the ROW anchor's context.
+            # Reusing W_j(context_j) would create a condition-ID shortcut.
+            # Checkpoint whole rows so N^2 decoding does not retain N copies
+            # of Transformer activations. Frozen DINO features are shared.
+            candidate_frames = torch.cat(paths[:sample_count], dim=0)
+
+            def encode_candidate_row(frames, context):
+                states = self.lava_world_encoder(
+                    frames, context=context[None, :].expand(frames.shape[0], -1))
+                state_paths = states.split(input_lengths, dim=0)
+                return torch.stack([
+                    calibrated_world_signature(state[1:] - state[:-1], time, scale)
+                    for state, time, scale in zip(state_paths, time_channels, lengths)
+                ])
+
+            rows = []
+            for context in selected_contexts:
+                if torch.is_grad_enabled():
+                    row = checkpoint(encode_candidate_row, candidate_frames, context,
+                                     use_reentrant=False, preserve_rng_state=False)
+                else:
+                    row = encode_candidate_row(candidate_frames, context)
+                rows.append(row)
+            candidate_signatures = torch.stack(rows)
+            positive_world_logits = torch.einsum(
+                "id,ijd->ij", action_signatures, candidate_signatures)
+        else:
+            positive_world_logits = action_signatures @ world_signatures.transpose(0, 1)
         if sample_count > 1:
             off_diagonal = ~torch.eye(
                 sample_count, dtype=torch.bool, device=device)
@@ -1386,6 +1550,13 @@ class VLAModel(nn.Module):
         batch_negative_mask = off_diagonal & same_scale
         batch_negative_values = positive_world_logits.masked_fill(
             ~batch_negative_mask, -torch.inf)
+        if individual_batch_negatives and self.lava_batch_negative_reduction == "mean":
+            # Change only batch mass: sum_j exp(s_ij/T) -> mean_j exp(s_ij/T).
+            # Keep the same candidates (including same-task paths), positives,
+            # local/far/order terms, and random-number consumption.
+            batch_counts = batch_negative_mask.sum(dim=1).clamp_min(1)
+            batch_negative_values = (
+                batch_negative_values - temperature * batch_counts.float().log()[:, None])
         cross_task_family_values, cross_task_candidate_counts = family_logmeanexp(
             positive_world_logits.masked_fill(~cross_same_scale_mask, -torch.inf))
         raw_cross_task_family_values = cross_task_family_values
@@ -2034,6 +2205,15 @@ class VLAModel(nn.Module):
                 "world_logsig_l2_energy_fraction": eligible_mean(world_l2_energy),
             }
 
+            if soft_reference is not None:
+                valid_reference = torch.ones_like(soft_reference, dtype=torch.bool)
+                first_scale = self.lava_signature_calibrator.scale_to_index.get(1)
+                if first_scale is not None:
+                    valid_reference[:, 1, first_scale] = False
+                reference_rms = soft_reference[valid_reference].sqrt()
+                diagnostics["signature_ema_rms_min"] = reference_rms.min().item()
+                diagnostics["signature_ema_rms_max"] = reference_rms.max().item()
+
             # LAVA aligns c_r with h_{r+1}. Record where supervision actually
             # lands in the action chunk without adding another forward pass.
             supervised_positions = torch.cat([
@@ -2244,6 +2424,15 @@ class VLAModel(nn.Module):
             # not the number of corruption candidates inside the order family.
             "lava_order_negative_count": len(block_action_indices),
         })
+        if conditioned:
+            with torch.no_grad():
+                gamma, beta = self.lava_world_encoder.film(
+                    self.lava_world_encoder.context_norm(selected_contexts)).chunk(2, dim=-1)
+                diagnostics.update({
+                    "film_gamma_rms": gamma.float().square().mean().sqrt().item(),
+                    "film_beta_rms": beta.float().square().mean().sqrt().item(),
+                    "film_context_count": sample_count,
+                })
         if individual_batch_negatives:
             batch_hardest = batch_negative_values.max(dim=1).values
             batch_valid = torch.isfinite(batch_hardest)
@@ -2313,6 +2502,7 @@ def calc_flow_matching_loss(
     temporal_negative_raw_actions=None,
     far_negative_normalized_actions=None,
     far_negative_raw_actions=None,
+    lava_context=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -2429,6 +2619,7 @@ def calc_flow_matching_loss(
     if use_lava and (world_feature_differences or world_feature_paths):
         loss_lava, lava_diagnostics = model.compute_lava_loss(
             action_hidden=preds["action_hidden"],
+            lava_context=lava_context,
             world_feature_paths=world_feature_paths,
             temporal_negative_feature_paths=temporal_negative_feature_paths,
             far_negative_feature_paths=far_negative_feature_paths,
