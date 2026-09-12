@@ -323,21 +323,23 @@ frame and candidate for an action anchor uses that anchor's context; batch
 candidates are recomputed under the row anchor's context with activation
 checkpointing.
 
-V6.3 (`configs/robotwin_lava_v63.yaml`) retains that architecture, removes the
-time channel, and replaces per-level unit normalization with positive-path
-EMA energy soft normalization:
+Revised V6.3 (`configs/robotwin_lava_v63.yaml`) retains that architecture and
+has no time channel. It uses one differentiable path scale for both LogSig
+levels, negative squared-distance matching, and episode-balanced negatives:
 
 ```text
-v <- 0.99 * v + 0.01 * mean_positive_paths(||S||^2)
-normalized_S = S / sqrt(||S||^2 + stop_gradient(v))
+s = (rho^4 + ||D||^4 + ||A||^2)^(1/4), rho = 1
+z = concat(D / s, A / s^2)
+score(a, w) = -sum((a - w)^2)
 ```
 
-Statistics are separate for each modality, level and scale, remain FP32, and
-are shared by all candidates within a forward pass. The concatenated spatial
-signature has 8,256 dimensions and uses fixed equal-level scaling without a
-final unit normalization. Batch/local/far negatives and order negatives at
-L>=4 are retained; action similarity weighting remains disabled.
+Each path computes its own scale in FP32, without EMA or final unit
+normalization. Each anchor uses up to four same-episode paths at least 2L
+away from the positive start and up to four unique same-scale paths from
+other episodes in the batch. Order and the old local/far buckets are disabled.
+Missing candidates preserve the positive and its policy supervision.
 
 The experiment trains from scratch for 12 epochs with batch128 and seed42.
-See [V6.3 design, training command and validation](docs/lava_v63.md), including
-the archived H100 NVL training and L40S evaluation submission scripts.
+The original EMA/dot/mixed-batch configuration and independent geometry,
+score and negative controls are retained under `configs/ablations/`.
+See [V6.3 design, controls, training and validation](docs/lava_v63.md).

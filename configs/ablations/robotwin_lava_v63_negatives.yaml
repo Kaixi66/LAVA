@@ -95,9 +95,9 @@ model:
       num_heads: 4
     logsig_depth: 2
     signature_normalization:
-      type: graded_soft
-      rho: 1.0
-    signature_score: neg_l2
+      type: ema_rms_soft
+      ema_momentum: 0.99
+    signature_score: dot
   action_expert:
     depth: 12
     hidden_size: 768
@@ -145,7 +145,7 @@ training:
   vel_weight_alpha: 0.2
   vel_weight_sigma: 0.01
   seed: 42
-  checkpoint_tag: robotwin10_lava_v6.3_1h100nvl
+  checkpoint_tag: robotwin10_lava_v6.3_negatives_1h100nvl
   lava_num_same_episode_negatives: 4
   lava_num_cross_episode_negatives: 4
   lava_negative_exclusion_multiplier: 2

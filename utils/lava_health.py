@@ -9,6 +9,7 @@ class LAVAHealthMonitor:
         if self.max_empty_batches < 1:
             raise ValueError('max_empty_batches must be positive')
         self.empty_batches = 0
+        self.no_candidate_batches = 0
 
     def check(self, batch, info):
         if not self.enabled:
@@ -18,6 +19,16 @@ class LAVAHealthMonitor:
         actual = int(info.get('lava_sample_count', 0))
         if actual != expected:
             raise RuntimeError(f'LAVA branch dropped supervision: dataset={expected}, loss={actual}')
+        if info.get('episode_balanced_mode'):
+            sampled = int(info.get('lava_sampled_anchor_count', -1))
+            encoded = int(info.get('lava_encoded_anchor_count', -1))
+            scored = int(info.get('lava_scored_anchor_count', -1))
+            unavailable = int(info.get('lava_no_negative_anchor_count', -1))
+            if sampled != expected or encoded != expected or not 0 <= scored <= encoded or scored + unavailable != encoded:
+                raise RuntimeError('Invalid sampled/encoded/scored episode_balanced accounting')
+            self.no_candidate_batches = self.no_candidate_batches + 1 if expected and not scored else 0
+            if not scored and float(info['loss_lava']) != 0.0:
+                raise RuntimeError('No-candidate LAVA batch must return a connected zero loss')
         if actual:
             self.empty_batches = 0
             if not math.isfinite(float(info['loss_lava'])):

@@ -145,7 +145,7 @@ training:
   vel_weight_alpha: 0.2
   vel_weight_sigma: 0.01
   seed: 42
-  checkpoint_tag: robotwin10_lava_v6.3_1h100nvl
+  checkpoint_tag: robotwin10_lava_v6.3_combined_1h100nvl
   lava_num_same_episode_negatives: 4
   lava_num_cross_episode_negatives: 4
   lava_negative_exclusion_multiplier: 2

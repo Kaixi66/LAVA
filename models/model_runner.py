@@ -106,7 +106,8 @@ class ModelFactory:
                 f"time_channel={lava_cfg.get('time_channel', True)}, "
                 f"residual_dim={lava_cfg.get('residual_dim', 32)}, "
                 f"logsig_depth={lava_cfg.get('logsig_depth', 2)}, "
-                f"signature_normalization={signature_norm_type}")
+                f"signature_normalization={signature_norm_type}, "
+                f"signature_score={lava_cfg.get('signature_score', 'dot')}")
 
         # Future-frame patch token count (number of queries for dense prediction); image_size=(W,H)
         img_w, img_h = tuple(config.dataset.image_size)
@@ -154,6 +155,8 @@ class ModelFactory:
             lava_logsig_depth=lava_cfg.get('logsig_depth', 2) if lava_cfg else 2,
             lava_action_target_layer=lava_cfg.get('action_target_layer', 'final') if lava_cfg else 'final',
             lava_signature_normalization=signature_norm_type,
+            lava_signature_rho=signature_norm_cfg.get('rho', 1.0),
+            lava_signature_score=lava_cfg.get('signature_score', 'dot'),
             lava_scales=tuple(config.training.get(
                 'lava_scales', [1, 2, 4, 8, 16])),
             lava_signature_ema_momentum=signature_norm_cfg.get(
@@ -164,6 +167,7 @@ class ModelFactory:
                 'lava_action_similarity_weighting', False)),
             lava_batch_negative_reduction=config.training.get(
                 'lava_batch_negative_reduction', 'sum'),
+            lava_num_cross_episode_negatives=int(config.training.get('lava_num_cross_episode_negatives', 4)),
             lava_action_component_calibration=bool(config.training.get(
                 'lava_action_component_calibration', False)),
             lava_action_similarity_min_weight=float(config.training.get(
@@ -241,7 +245,10 @@ class VLAWrapper(nn.Module):
             self.lava_negative_mode = train_config.get('lava_negative_mode', 'batch')
             self.lava_action_similarity_weighting = bool(
                 train_config.get('lava_action_similarity_weighting', False))
-            if self.lava_negative_mode not in {'batch', 'episode_local', 'mixed', 'mixed_batch'}:
+            if self.lava_negative_mode == 'episode_balanced':
+                if self.lava_order_negative or self.lava_action_similarity_weighting:
+                    raise ValueError('episode_balanced requires order and action weighting disabled')
+            if self.lava_negative_mode not in {'batch', 'episode_local', 'mixed', 'mixed_batch', 'episode_balanced'}:
                 raise ValueError(
                     "lava_negative_mode must be 'batch', 'episode_local', "
                     "'mixed', or 'mixed_batch', got "
@@ -493,6 +500,7 @@ class VLAWrapper(nn.Module):
         world_features = None
         local_features = None
         far_features = None
+        same_episode_features = None
         temporal_negative_actions_raw = None
         temporal_negative_actions_normalized = None
         far_negative_actions_raw = None
@@ -501,7 +509,23 @@ class VLAWrapper(nn.Module):
             positive_paths = batch['evolution_pixel_values']
             temporal_negative_paths = batch.get('temporal_negative_pixel_values')
             far_negative_paths = batch.get('far_negative_pixel_values')
-            if self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
+            if self.lava_negative_mode == 'episode_balanced':
+                if temporal_negative_paths is not None or far_negative_paths is not None:
+                    raise ValueError('episode_balanced must not receive old local/far paths')
+                negative_groups = batch.get('same_episode_negative_pixel_values')
+                if negative_groups is None or len(negative_groups) != len(positive_paths):
+                    raise ValueError('episode_balanced requires one ragged negative list per positive')
+                all_features = extract_features(positive_paths + [path for group in negative_groups for path in group])
+                world_features = all_features[:len(positive_paths)]
+                same_episode_features = []
+                offset = len(positive_paths)
+                for group, scale in zip(negative_groups, batch['evolution_scales'].tolist()):
+                    features = all_features[offset:offset + len(group)]
+                    if any(path.shape[0] != scale + int(state_mode) for path in features):
+                        raise ValueError('Invalid same-episode negative feature length')
+                    same_episode_features.append(features)
+                    offset += len(group)
+            elif self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
                 if temporal_negative_paths is None:
                     raise ValueError(
                         f"{self.lava_negative_mode} LAVA requires one local-negative path "
@@ -592,6 +616,9 @@ class VLAWrapper(nn.Module):
             far_negative_feature_paths=far_features if state_mode else None,
             lava_batch_indices=batch.get('evolution_batch_indices'),
             lava_context=lava_context,
+            same_episode_negative_features=same_episode_features,
+            lava_episode_uids=batch.get('evolution_episode_uid'),
+            lava_absolute_starts=batch.get('evolution_absolute_start'),
             lava_interval_starts=batch.get('evolution_starts'),
             lava_interval_scales=batch.get('evolution_scales'),
             use_lava=self.use_lava,

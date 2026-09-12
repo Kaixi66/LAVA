@@ -1,121 +1,164 @@
-# LAVA V6.3
+# Revised LAVA V6.3
 
-Experiment: `robotwin10_lava_v6.3_1h100nvl`.
+Experiment: `robotwin10_lava_v6.3_1h100nvl`. This revision combines the provided
+[geometry specification](specifications/Codex_A_Geometry.md) and
+[negative specification](specifications/Codex_B_Negatives.md). The user
+explicitly requested replacing the original V6.3 training and publishing the
+revision. It starts from scratch, preserving old results in an archive.
 
-V6.3 removes the fixed time coordinate and changes signature normalization to
-avoid amplifying isolated near-zero first- or second-level features. It
-retains the current-observation FiLM architecture introduced in V6.2. Time
-removal and normalization replacement form one combined experiment, so its
-SR comparison cannot isolate their individual effects.
+Baseline commit: `7bcfc1e2c480e50e3707ac18c8a8a13521667bda`. Its complete config
+is retained at `configs/ablations/robotwin_lava_v63_original.yaml`.
+Old normalizers, dot scoring and mixed-batch behavior remain available.
+Checkpoint loading stays strict; cross-normalizer weight migration is not
+implemented.
 
-## Representation and candidates
+## Geometry and matching
 
-- Eight ordered queries, 16 output dimensions each: 128-dimensional states.
-- Encode frames with a shared encoder, then subtract adjacent states. For a
-  fixed anchor context c, `r_k = Phi(Z_k; c) - Phi(Z_(k-1); c)`, so increments
-  sum to `Phi(Z_L; c) - Phi(Z_0; c)`.
-- FiLM uses pooled DINO patches from the current policy observation. Every
-  positive, local, far and batch candidate for a row uses the row's context.
-  Candidate-row activation checkpointing limits retained encoder activations.
-- Scales are `[1,2,4,8,16]`. Spatial depth-2 LogSig has
-  `128 + 128*127/2 = 8256` coordinates, compared with V6.2's 8385 with time.
-- L=1 has an effective first level and a zero-padded second level. L>=2
-  retains both levels.
-- Same-scale batch negatives are independent candidates, including same-task
-  paths. Batch exponential mass is summed. Local/far candidates and the
-  pooled block-swap/full-derangement order family at L>=4 are unchanged.
-  Action similarity weighting is disabled.
-
-## Normalization
-
-Mode: `ema_rms_soft`, implemented by `EMASoftLogSignatureNormalizer`.
-
-For each modality (action/world), signature level and temporal scale, use:
+Keep 8 ordered queries × 16 dimensions, current-observation FiLM, the action
+projector and shared encode-before-subtract world residuals. Every frame in
+a path uses the row anchor's fixed context c:
 
 ```text
-batch_energy = mean_positive_paths(sum_coordinates(S**2))
-v = 0.99 * v + 0.01 * batch_energy
-normalized_S = S / sqrt(sum_coordinates(S**2) + stop_gradient(v))
+r_k = Phi(Z_k; c) - Phi(Z_(k-1); c)
+sum(r_k) = Phi(Z_L; c) - Phi(Z_0; c)
 ```
 
-Squared-energy buffers start at 1.0 and use the moving-average update from
-the first batch, including an all-zero first batch. Buffers and normalization
-arithmetic remain FP32 when the model is cast to BF16. Updates use positive
-paths only, once per loss forward. All candidates capture the same reference
-statistics; backward checkpoint recomputation neither updates them nor reads
-later forward updates. EMA buffers are saved in the model state dict.
+The new `graded_soft` readout uses raw first-level D and the existing upper
+triangle of the antisymmetric second-level A, without double-counting area:
 
 ```text
-K = 1 if L == 1 else 2
-signature = concat(normalized_D, normalized_A) / sqrt(K)
+s = (rho^4 + ||D||_2^4 + ||A||_2^2)^(1/4)
+z = concat(D / s, A / s^2)
+rho = 1.0
 ```
 
-The structural L=1 second level is excluded from EMA updates and scoring.
-There is no final unit/cosine normalization and no additional second-level
-weight. Scoring uses signature dot products, temperature 0.07 and
-lambda_LAVA 0.01. Weak signatures can stay weak. Raw auxiliary loss values
-are not directly comparable to the previous normalization objective.
+Each action path and world candidate computes its own differentiable s.
+Both modalities use the same function and fixed finite positive rho. The
+readout runs in FP32 with autocast disabled. There is no EMA, detached scale,
+per-level or final unit normalization, sqrt(2) divisor, or extra area weight.
+Rho specifies a latent scale, not a measured physical noise threshold.
 
-## Training and evaluation
+The first implementation requires state-delta encoding without time. Depth2
+has 8256 coordinates. At L=1, area is zero-padded. Depth1 returns only D/s
+and its scale ignores A. Residual telescoping remains valid; independently
+normalized windows do not directly obey the raw Chen composition identity.
 
-Use [the V6.3 configuration](../configs/robotwin_lava_v63.yaml). It records the
-production RoboTwin 10-task subset settings: seed42, batch128, 12 epochs
-(54,288 optimizer steps for that dataset), LR 2e-4 to 5e-5, LAVA ratio 0.125,
-task/episode balancing and 5% LAVA warmup. Dataset, conditioning, statistics
-and DINO paths must point to the assets in the local workspace.
+The independent `signature_score` switch defaults to `dot`. `neg_l2` uses:
 
-From the repository root in the training environment:
+```text
+score(a, w) = -sum_coordinates((a.float() - w.float())^2)
+loss = cross_entropy(scores / temperature, positive_index)
+```
+
+It applies to all positive, batch, local, far and order matching before any
+existing family reductions. Matching similarity/margin diagnostics use the
+selected scorer and are not cosine values in distance mode. Pure
+representation dot-product diagnostics in the legacy branch retain their
+original definitions.
+
+Temperature stays 0.07. Because `-||a-w||^2 = 2*a.w - ||a||^2 - ||w||^2`,
+the score-only ablation changes the dot coefficient as well as the
+candidate-norm term. It tests the scoring rule as a whole, not an isolated
+norm penalty. No temperature search is launched.
+
+## Episode-balanced candidates
+
+The existing positive interval sampler is retained. With observation t_obs,
+relative start start and scale L, the positive begins at p=t_obs+start and
+contains L+1 frames.
+
+- Same episode: uniformly sample up to four distinct legal starts n with
+  `0 <= n <= T-L-1` and `abs(n-p) >= 2L`. There are no local/far buckets,
+  relaxed exclusions, replacement or extra spacing between negatives.
+- Cross episode: uniformly select up to four unique same-scale positive
+  paths already in the batch, excluding the anchor's physical episode.
+  Deduplicate `(episode_uid, absolute_start, scale)`. Canonical HDF5 paths
+  identify episodes, including their task/clean/randomized directory.
+  Other episodes of the same task are allowed.
+- The denominator has exactly one positive plus 0..4 same-episode and 0..4
+  cross-episode independent logits. There are no order, old local/far,
+  unselected batch candidates, family averages or source weights.
+- Shortages reduce candidate counts. An anchor with no negative contributes
+  no contrastive term; the loss averages only eligible anchors. If the entire
+  batch lacks candidates, return a connected zero. Every positive remains
+  encoded and can be another row's candidate. All policy flow/future losses
+  remain active.
+
+All candidates use the ROW anchor's current observation context for every
+frame. Cross candidates reuse frozen DINO features and are decoded again
+under that context. Random selection happens outside activation checkpoint
+recomputation. Episode IDs and absolute starts never enter the network.
+
+B-only EMA normalization still updates once from all sampled positives,
+including skipped rows, and shares the captured reference across candidates.
+Diagnostics distinguish sampled, encoded and scored anchors, missing-source
+reasons, actual same/cross counts and availability. Health monitoring checks
+accounting and autograd connectivity.
+
+This changes the negative scheme as a whole: source mix, total count,
+temporal exclusion, order and shortage handling. It does not guarantee
+semantic negativity or isolate which rule influences SR.
+
+## Complete configurations
+
+Every YAML below is complete, with no implicit inheritance. Paths are under
+`configs/ablations/`.
+
+| File | Normalizer | Score | Negatives | Order |
+|---|---|---|---|---|
+| `robotwin_lava_v63_original.yaml` | ema_rms_soft | dot | mixed_batch | on |
+| `robotwin_lava_v63_norm_only.yaml` | graded_soft | dot | mixed_batch | on |
+| `robotwin_lava_v63_score_only.yaml` | ema_rms_soft | neg_l2 | mixed_batch | on |
+| `robotwin_lava_v63_geometry.yaml` | graded_soft | neg_l2 | mixed_batch | on |
+| `robotwin_lava_v63_negatives.yaml` | ema_rms_soft | dot | episode_balanced | off |
+| `robotwin_lava_v63_order_off.yaml` | ema_rms_soft | dot | mixed_batch | off |
+| `robotwin_lava_v63_combined.yaml` | graded_soft | neg_l2 | episode_balanced | off |
+
+Ablations have distinct checkpoint tags. The original config retains its
+historical tag for identification; choose a fresh output directory when
+rerunning it. `configs/robotwin_lava_v63.yaml` equals the combined config
+except for the original experiment tag. Only that combined production
+experiment is submitted, not an ablation sweep.
+
+All retain seed42, batch128, 12 epochs, LR 2e-4 to 5e-5, temperature0.07,
+lambda0.01, 5% LAVA warmup, scales1/2/4/8/16, LAVA ratio0.125 and existing
+task/episode balance. Dataset, statistics and DINO paths need local assets.
 
 ```bash
-python train.py \
-  --config configs/robotwin_lava_v63.yaml \
+python train.py --config configs/robotwin_lava_v63.yaml \
   --norm_stats_path /fs/cml-projects/WAM/data/robotwin_200_10_assets/stat-local-200-10.json \
   --save_dir /fs/cml-projects/WAM/runs/LAVA/robotwin/stage1/robotwin10_lava_v6.3_1h100nvl
 ```
 
-This starts a new training run without loading V6.2 weights. Production
-scheduling records submitted on 2026-09-12 were:
-
-| Job | Resource | Dependency |
-|---|---|---|
-| V6.3 training 7508179 | 1 H100 NVL | afterany:7497586 (V6.2) |
-| V6.3 evaluation 7508180 | 1 L40S | afterok:7508179 |
-
-Evaluation selects epoch12 and runs 50 episodes for each of the 10 tasks
-with video recording. Exact cluster submission scripts are archived at
-[training](../scripts/slurm/archive/v63/train_robotwin_lava_v63_stage1_1_h100_nvl.sbatch)
-and [evaluation](../scripts/slurm/archive/v63/eval_robotwin10_lava_v63_1_l40s.sbatch).
-They reference the original CML workspace, Slurm accounts, environments and
-pre-created immutable `provenance/source` snapshot; they do not create those
-assets on a fresh checkout. The source manifest is archived alongside them
-for identifying the original run. It also inventories auxiliary files copied
-into that snapshot which are not required for RoboTwin V6.3 training.
-
-## Validation
-
-The focused regression suite passed 81 tests before production submission:
+## Validation and deployment
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. \
-python -m pytest -q tests/test_lava_soft_normalization.py \
-  tests/test_lava_film.py tests/test_lava_batch_mean.py tests/test_lava.py
+python -m pytest -q tests/test_lava_geometry.py \
+  tests/test_lava_episode_balanced.py tests/test_lava_soft_normalization.py \
+  tests/test_lava_film.py tests/test_lava_batch_mean.py tests/test_lava.py \
+  tests/test_lava_dataset_pipeline.py
 ```
 
-Coverage includes static/tiny signatures at every scale, BF16 behavior,
-FP32 EMA preservation, checkpoint round trips, frozen references during
-activation recomputation, FiLM context mapping and negative aggregation.
-The shared implementation includes an optional batch-mean reduction tested
-for compatibility; V6.3 uses the default sum reduction.
+Tests cover published-code loss/gradient compatibility, exact graded formula,
+zero/tiny paths, weak area, depth1/2, distance ranking, BF16, row context,
+checkpoint recomputation, strict state loading, HDF5/collate metadata,
+exact CE counts, shortages and unchanged policy flow/future losses.
+DINO extraction remains frozen and inference code is unchanged.
 
-Real-data validation job7508130 completed 200 full-model steps with batch128,
-16 data workers and lambda_LAVA=0.01 from the first step (a stress check;
-production retains its warmup). All 200 steps had active LAVA and FiLM
-gradients; peak allocated memory was approximately 24.0 GiB on L40S.
+A 200-step real-data short run at full lambda, batch128 and 16 workers is
+required before production submission. Actual test, short-training and
+scheduling results are recorded in
+[validation/lava_v63_revised.json](validation/lava_v63_revised.json).
+These bounded checks do not establish SR benefit or full-run stability.
 
-Replay job7508131 evaluated the same 64 real L=2 batches (1,068 anchors per
-checkpoint), including the previously identified degenerate local/far cases.
-With fixed V6.2 epoch2 weights, the maximum LAVA branch gradient decreased
-from 5.853 under the original objective to 0.124 under the V6.3 objective.
-This used a newly initialized, updating EMA and no optimizer steps. These
-bounded checks target the observed normalization mechanism; they do not
-establish full-run stability, order-negative validity or an SR improvement.
+Original train7508179 and eval7508180 were cancelled at the user's request.
+Its valid results and immutable source are preserved at
+`runs/LAVA/superseded/v63_ema_rms_soft_7508179_20260912/robotwin10_lava_v6.3_1h100nvl`.
+The replacement uses a fresh directory at the original run path. Batchmean
+7497812 follows the replacement; a new L40S eval requires successful training.
+
+Original scripts remain at `scripts/slurm/archive/v63/`. Revised scripts and
+source hashes are archived at `scripts/slurm/archive/v63_revised/`. They
+reference CML-specific accounts, environments and a pre-created immutable
+source snapshot; they do not provision a fresh checkout's external assets.

@@ -1,0 +1,391 @@
+{
+  "design": {
+    "normalization": "graded_soft",
+    "rho": 1.0,
+    "score": "neg_l2",
+    "negatives": "episode_balanced",
+    "same_episode_target": 4,
+    "cross_episode_target": 4,
+    "exclusion_multiplier": 2,
+    "order": false,
+    "time": false,
+    "queries": 8,
+    "query_dim": 16,
+    "lambda": 0.01,
+    "temperature": 0.07
+  },
+  "unit_tests": {
+    "passed": 188,
+    "duration_seconds": 65.85,
+    "command": "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. python -m pytest -q tests/test_lava_geometry.py tests/test_lava_episode_balanced.py tests/test_lava_soft_normalization.py tests/test_lava_film.py tests/test_lava_batch_mean.py tests/test_lava.py tests/test_lava_dataset_pipeline.py"
+  },
+  "real_training_validation": {
+    "passed": true,
+    "errors": [],
+    "rows": 200,
+    "active_steps": 200,
+    "empty_lava_steps": 0,
+    "total_lava_anchors": 3057.0,
+    "scales": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "total_scored_anchors": 3057.0,
+    "total_skipped_anchors": 0.0,
+    "stats": {
+      "Loss": {
+        "min": 0.236946,
+        "median": 0.29483000000000004,
+        "max": 2.154672
+      },
+      "Loss_Flow": {
+        "min": 0.055595,
+        "median": 0.09606100000000001,
+        "max": 1.608882
+      },
+      "Loss_Future": {
+        "min": 0.318406,
+        "median": 0.35250000000000004,
+        "max": 1.015642
+      },
+      "Loss_LAVA": {
+        "min": 1.81235,
+        "median": 2.1870155000000002,
+        "max": 3.796985
+      },
+      "Lambda_LAVA": {
+        "min": 0.01,
+        "median": 0.01,
+        "max": 0.01
+      },
+      "Grad_Norm": {
+        "min": 0.507812,
+        "median": 0.923828,
+        "max": 11.4375
+      },
+      "Grad_Norm_LAVA_Branch": {
+        "min": 0.009872,
+        "median": 0.0226045,
+        "max": 10.137577
+      },
+      "FiLM_Grad_Norm": {
+        "min": 0.0014325,
+        "median": 0.00288368,
+        "max": 10.12233543
+      },
+      "FiLM_Gamma_RMS": {
+        "min": 0.0,
+        "median": 0.40265657,
+        "max": 0.45798579
+      },
+      "FiLM_Beta_RMS": {
+        "min": 0.0,
+        "median": 0.383007125,
+        "max": 0.40897757
+      },
+      "FiLM_Context_Count": {
+        "min": 6.0,
+        "median": 15.0,
+        "max": 30.0
+      },
+      "LAVA_Samples": {
+        "min": 6.0,
+        "median": 15.0,
+        "max": 30.0
+      },
+      "State_Endpoint_Error": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 2e-08
+      },
+      "GPU_Peak_Allocated_GB": {
+        "min": 16.2675,
+        "median": 17.34135,
+        "max": 24.8545
+      },
+      "Episode_Balanced_Mode": {
+        "min": 1.0,
+        "median": 1.0,
+        "max": 1.0
+      },
+      "LAVA_Sampled_Anchors": {
+        "min": 6.0,
+        "median": 15.0,
+        "max": 30.0
+      },
+      "LAVA_Encoded_Anchors": {
+        "min": 6.0,
+        "median": 15.0,
+        "max": 30.0
+      },
+      "LAVA_Scored_Anchors": {
+        "min": 6.0,
+        "median": 15.0,
+        "max": 30.0
+      },
+      "LAVA_No_Negative_Anchors": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      },
+      "LAVA_No_Same_Episode": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      },
+      "LAVA_No_Cross_Episode": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      },
+      "Same_Episode_Negative_Count": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Cross_Episode_Negative_Count": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Same_Episode_Negative_Min": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Same_Episode_Negative_Max": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Cross_Episode_Negative_Min": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Cross_Episode_Negative_Max": {
+        "min": 4.0,
+        "median": 4.0,
+        "max": 4.0
+      },
+      "Negative_Candidate_Count": {
+        "min": 8.0,
+        "median": 8.0,
+        "max": 8.0
+      },
+      "Negative_Candidate_Availability": {
+        "min": 1.0,
+        "median": 1.0,
+        "max": 1.0
+      },
+      "Order_Negatives": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      }
+    },
+    "branch_gradient_spikes_gt1": [
+      {
+        "step": 1,
+        "scale": 8.0,
+        "branch_grad": 10.137577,
+        "film_grad": 10.12233543
+      }
+    ],
+    "scope": "CSV checks cover the observed training prefix only. They do not prove full-run stability or replace semantic FiLM tests. Finite gradient spikes are reported, not silently removed.",
+    "validation_job": "7513356",
+    "csv": "/fs/cml-projects/WAM/runs/LAVA/validation/v63_revised_20260912/smoke200_results/sft_2026-09-12_12-17-35/log/train_loss_2026-09-12_12-17-35.csv",
+    "scheduler": "7513356|COMPLETED|0:0",
+    "source_mismatches": [],
+    "error_lines": []
+  },
+  "submission": {
+    "time_utc": "2026-09-12T16:16:57.932775+00:00",
+    "old_train": 7508179,
+    "old_eval": 7508180,
+    "old_complete_audit": 7508182,
+    "batchmean": 7497812,
+    "superseded_l40_smoke": 7513345,
+    "reason": "User requested replacement of V6.3 with combined Codex A+B design and upload to GitHub.",
+    "old_last_step": "4707",
+    "old_csv": "/fs/cml-projects/WAM/runs/LAVA/robotwin/stage1/robotwin10_lava_v6.3_1h100nvl/sft_2026-09-12_10-12-25/log/train_loss_2026-09-12_10-12-25.csv",
+    "old_archive": "/fs/cml-projects/WAM/runs/LAVA/superseded/v63_ema_rms_soft_7508179_20260912/robotwin10_lava_v6.3_1h100nvl",
+    "old_train_state": "CANCELLED",
+    "validation_nvl_job": 7513356,
+    "revision": "geometry_episode_balanced_20260912",
+    "run_name": "robotwin10_lava_v6.3_1h100nvl",
+    "from_scratch": true,
+    "train_job": 7513385,
+    "eval_job": 7513386,
+    "startup_audit_job": 7513387,
+    "complete_audit_job": 7513388,
+    "train_dependency": "afterok:7513356",
+    "eval_dependency": "afterok:7513385",
+    "batchmean_dependency": "afterany:7513385",
+    "batchmean_released": true,
+    "submitted_at": "2026-09-12T16:27:29.388338+00:00"
+  },
+  "config_differences": {
+    "robotwin_lava_v63_combined.yaml": {
+      "model.lava.signature_normalization.ema_momentum": {
+        "new": null,
+        "old": 0.99
+      },
+      "model.lava.signature_normalization.rho": {
+        "new": 1.0,
+        "old": null
+      },
+      "model.lava.signature_normalization.type": {
+        "new": "graded_soft",
+        "old": "ema_rms_soft"
+      },
+      "model.lava.signature_score": {
+        "new": "neg_l2",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_combined_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      },
+      "training.lava_negative_exclusion_multiplier": {
+        "new": 2,
+        "old": null
+      },
+      "training.lava_negative_mode": {
+        "new": "episode_balanced",
+        "old": "mixed_batch"
+      },
+      "training.lava_negative_window_max": {
+        "new": null,
+        "old": 32
+      },
+      "training.lava_negative_window_multiplier": {
+        "new": null,
+        "old": 4
+      },
+      "training.lava_num_cross_episode_negatives": {
+        "new": 4,
+        "old": null
+      },
+      "training.lava_num_same_episode_negatives": {
+        "new": 4,
+        "old": null
+      },
+      "training.lava_order_negative": {
+        "new": false,
+        "old": true
+      }
+    },
+    "robotwin_lava_v63_geometry.yaml": {
+      "model.lava.signature_normalization.ema_momentum": {
+        "new": null,
+        "old": 0.99
+      },
+      "model.lava.signature_normalization.rho": {
+        "new": 1.0,
+        "old": null
+      },
+      "model.lava.signature_normalization.type": {
+        "new": "graded_soft",
+        "old": "ema_rms_soft"
+      },
+      "model.lava.signature_score": {
+        "new": "neg_l2",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_geometry_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      }
+    },
+    "robotwin_lava_v63_negatives.yaml": {
+      "model.lava.signature_score": {
+        "new": "dot",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_negatives_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      },
+      "training.lava_negative_exclusion_multiplier": {
+        "new": 2,
+        "old": null
+      },
+      "training.lava_negative_mode": {
+        "new": "episode_balanced",
+        "old": "mixed_batch"
+      },
+      "training.lava_negative_window_max": {
+        "new": null,
+        "old": 32
+      },
+      "training.lava_negative_window_multiplier": {
+        "new": null,
+        "old": 4
+      },
+      "training.lava_num_cross_episode_negatives": {
+        "new": 4,
+        "old": null
+      },
+      "training.lava_num_same_episode_negatives": {
+        "new": 4,
+        "old": null
+      },
+      "training.lava_order_negative": {
+        "new": false,
+        "old": true
+      }
+    },
+    "robotwin_lava_v63_norm_only.yaml": {
+      "model.lava.signature_normalization.ema_momentum": {
+        "new": null,
+        "old": 0.99
+      },
+      "model.lava.signature_normalization.rho": {
+        "new": 1.0,
+        "old": null
+      },
+      "model.lava.signature_normalization.type": {
+        "new": "graded_soft",
+        "old": "ema_rms_soft"
+      },
+      "model.lava.signature_score": {
+        "new": "dot",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_norm_only_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      }
+    },
+    "robotwin_lava_v63_order_off.yaml": {
+      "model.lava.signature_score": {
+        "new": "dot",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_order_off_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      },
+      "training.lava_order_negative": {
+        "new": false,
+        "old": true
+      }
+    },
+    "robotwin_lava_v63_original.yaml": {},
+    "robotwin_lava_v63_score_only.yaml": {
+      "model.lava.signature_score": {
+        "new": "neg_l2",
+        "old": null
+      },
+      "training.checkpoint_tag": {
+        "new": "robotwin10_lava_v6.3_score_only_1h100nvl",
+        "old": "robotwin10_lava_v6.3_1h100nvl"
+      }
+    }
+  },
+  "limitation": "Bounded tests and 200 full-lambda steps do not prove full-run stability or SR improvement. Stress-run first-step LAVA gradient was 10.137577; subsequent 199 steps max 0.13096. Production retains 5% warmup."
+}

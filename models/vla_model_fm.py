@@ -286,6 +286,62 @@ def _raw_logsignature_levels(path_increments):
     return level_one, level_two
 
 
+def graded_soft_logsignature(level_one, level_two, scale, depth=2, rho=1.0):
+    """One differentiable path scale, with homogeneous scaling by level."""
+    if not math.isfinite(rho) or rho <= 0:
+        raise ValueError("graded_soft rho must be finite and positive")
+    if depth not in (1, 2):
+        raise ValueError("LogSig depth must be 1 or 2")
+    with torch.autocast(device_type=level_one.device.type, enabled=False):
+        delta, area = level_one.float(), level_two.float()
+        if depth == 1 or int(scale) == 1:
+            area = torch.zeros_like(area)
+        d2 = delta.square().sum(dim=-1, keepdim=True)
+        a2 = area.square().sum(dim=-1, keepdim=True)
+        s2 = (rho ** 4 + d2.square() + a2).sqrt()
+        one, two = delta / s2.sqrt(), area / s2
+        signature = one if depth == 1 else torch.cat((one, two), dim=-1)
+        one_energy = one.detach().square().sum(dim=-1)
+        two_energy = two.detach().square().sum(dim=-1)
+        return signature, {
+            "level1_calibrated_norm": one_energy.sqrt(),
+            "level2_calibrated_norm": two_energy.sqrt(),
+            "level2_energy_fraction": two_energy / (one_energy + two_energy).clamp_min(1e-12),
+            "level1_ema_rms": one.new_tensor(float("nan")),
+            "level2_ema_rms": one.new_tensor(float("nan")),
+        }
+
+
+def lava_signature_score(action, world, score_type="dot"):
+    """Paired/broadcast signature score; neg_l2 sums coordinates in FP32."""
+    if score_type == "dot":
+        return (action * world).sum(dim=-1)
+    if score_type != "neg_l2":
+        raise ValueError("signature_score must be dot or neg_l2")
+    with torch.autocast(device_type=action.device.type, enabled=False):
+        return -(action.float() - world.float()).square().sum(dim=-1)
+
+
+def sample_cross_episode_indices(episode_uids, absolute_starts, scales, count=4):
+    """Sample unique same-scale paths, outside activation recomputation."""
+    if not 0 <= count <= 4:
+        raise ValueError("episode_balanced requires 0..4 cross-episode negatives")
+    if not (len(episode_uids) == len(absolute_starts) == len(scales)):
+        raise ValueError("Episode metadata lengths must match positive paths")
+    if any(not isinstance(uid, str) or not uid for uid in episode_uids):
+        raise ValueError("episode_uid must be a nonempty globally unique identifier")
+    rows = []
+    for uid, scale in zip(episode_uids, scales):
+        unique = {}
+        for j, (other, start, other_scale) in enumerate(zip(episode_uids, absolute_starts, scales)):
+            if other != uid and int(other_scale) == int(scale):
+                unique.setdefault((other, int(start), int(other_scale)), j)
+        candidates = list(unique.values())
+        permutation = torch.randperm(len(candidates)).tolist()
+        rows.append([candidates[j] for j in permutation[:count]])
+    return rows
+
+
 def normalized_logsignature(path_increments, depth=2, eps=1e-6,
                             return_raw_norms=False):
     """Closed-form depth-1/2 log-signature of a piecewise-linear path.
@@ -756,8 +812,11 @@ class VLAModel(nn.Module):
                  lava_scales=(1, 2, 4, 8, 16),
                  lava_signature_ema_momentum=0.99,
                  lava_signature_level2_weight=0.5,
+                 lava_signature_rho=1.0,
+                 lava_signature_score="dot",
                  lava_action_similarity_weighting=False,
                  lava_batch_negative_reduction="sum",
+                 lava_num_cross_episode_negatives=4,
                  lava_action_component_calibration=False,
                  lava_action_similarity_min_weight=0.1,
                  lava_action_similarity_beta_momentum=0.99,
@@ -795,14 +854,26 @@ class VLAModel(nn.Module):
         self.lava_logsig_depth = lava_logsig_depth
         self.lava_signature_normalization = str(
             lava_signature_normalization).lower()
+        self.lava_signature_rho = float(lava_signature_rho)
+        self.lava_signature_score = str(lava_signature_score)
+        if self.lava_signature_score not in {"dot", "neg_l2"}:
+            raise ValueError("signature_score must be dot or neg_l2")
+        if self.lava_signature_normalization == "graded_soft":
+            if self.lava_world_encoding != "state_delta" or self.lava_time_channel:
+                raise ValueError("graded_soft requires state_delta and no time channel")
+            if not math.isfinite(self.lava_signature_rho) or self.lava_signature_rho <= 0:
+                raise ValueError("graded_soft rho must be finite and positive")
         if self.lava_signature_normalization not in {
-                "per_level_unit", "ema_calibrated", "ema_rms_soft"}:
+                "per_level_unit", "ema_calibrated", "ema_rms_soft", "graded_soft"}:
             raise ValueError(
                 "lava_signature_normalization must be per_level_unit, "
-                f"ema_calibrated or ema_rms_soft, got {self.lava_signature_normalization}")
+                f"ema_calibrated, ema_rms_soft or graded_soft, got {self.lava_signature_normalization}")
         self.lava_action_similarity_weighting = bool(
             lava_action_similarity_weighting)
         self.lava_batch_negative_reduction = str(lava_batch_negative_reduction)
+        self.lava_num_cross_episode_negatives = int(lava_num_cross_episode_negatives)
+        if not 0 <= self.lava_num_cross_episode_negatives <= 4:
+            raise ValueError("episode_balanced requires 0..4 cross-episode negatives")
         if self.lava_batch_negative_reduction not in {"sum", "mean"}:
             raise ValueError("lava_batch_negative_reduction must be sum or mean")
         self.lava_action_component_calibration = bool(
@@ -1094,6 +1165,150 @@ class VLAModel(nn.Module):
             "final_action_hidden": x_action_out,
         }
 
+    def _episode_balanced_objective(
+            self, action_signatures, world_signatures, positive_paths,
+            same_paths, episode_uids, absolute_starts, lengths, contexts,
+            time_channels, build_world_signature, action_levels, world_levels,
+            action_calibration, world_calibration, action_residuals, world_residuals,
+            interval_starts, execution_horizon, endpoint_error, soft_reference, temperature):
+        """Independent 0..4 same-episode + 0..4 cross-episode candidate logits."""
+        count = len(positive_paths)
+        if same_paths is None or len(same_paths) != count:
+            raise ValueError("episode_balanced requires a ragged same-episode list per anchor")
+        if episode_uids is None or absolute_starts is None:
+            raise ValueError("episode_balanced requires episode_uid and absolute start metadata")
+        if any(len(group) > 4 for group in same_paths):
+            raise ValueError("Too many same-episode negatives")
+        # Sampling occurs exactly once, before any checkpointed computation.
+        cross_indices = sample_cross_episode_indices(
+            episode_uids, absolute_starts, lengths, self.lava_num_cross_episode_negatives)
+        action = torch.stack(action_signatures)
+        world = torch.stack(world_signatures)
+        positive_scores = lava_signature_score(action, world, self.lava_signature_score)
+        rows, same_counts, cross_counts = [], [], []
+        state_mode = self.lava_world_encoding == "state_delta"
+        for i, scale in enumerate(lengths):
+            candidates = list(same_paths[i]) + [positive_paths[j] for j in cross_indices[i]]
+            same_counts.append(len(same_paths[i]))
+            cross_counts.append(len(cross_indices[i]))
+            if not candidates:
+                rows.append(positive_scores[i:i + 1])
+                continue
+            path_length = scale + int(state_mode)
+            if any(path.shape[0] != path_length for path in candidates):
+                raise ValueError("episode_balanced candidate length does not match anchor scale")
+            frames = torch.cat([path.to(device=action.device, dtype=positive_paths[i].dtype)
+                                for path in candidates])
+            context = contexts[i] if contexts is not None else action.new_empty(0)
+
+            def encode_row(frames, context, path_length=path_length, scale=scale,
+                           time=time_channels[i], conditioned=contexts is not None):
+                states = (self.lava_world_encoder(frames, context=context[None].expand(len(frames), -1))
+                          if conditioned else self.lava_world_encoder(frames))
+                return torch.stack([build_world_signature(
+                    path[1:] - path[:-1] if state_mode else path, time, scale)
+                    for path in states.split(path_length)])
+
+            signatures = (checkpoint(encode_row, frames, context, use_reentrant=False,
+                                     preserve_rng_state=False)
+                          if torch.is_grad_enabled() else encode_row(frames, context))
+            negative_scores = lava_signature_score(action[i], signatures, self.lava_signature_score)
+            rows.append(torch.cat((positive_scores[i:i + 1], negative_scores)))
+        width = max(map(len, rows))
+        logits = torch.stack([F.pad(row, (0, width - len(row)), value=-torch.inf) for row in rows])
+        same = torch.tensor(same_counts, device=action.device)
+        cross = torch.tensor(cross_counts, device=action.device)
+        valid = (same + cross) > 0
+        losses = torch.full_like(positive_scores, float("nan"))
+        accuracy = torch.full_like(positive_scores, float("nan"))
+        if valid.any():
+            selected_losses = F.cross_entropy(logits[valid] / temperature,
+                torch.zeros(int(valid.sum()), device=action.device, dtype=torch.long), reduction="none")
+            loss = selected_losses.mean()
+            losses = losses.index_copy(0, valid.nonzero().flatten(), selected_losses)
+            accuracy[valid] = (logits[valid].argmax(1) == 0).float()
+        else:
+            # Keep the actual encoded positives connected, including FiLM and
+            # the action projector. Policy flow/future losses are untouched.
+            loss = (action.sum() + world.sum()) * 0.0
+
+        with torch.no_grad():
+            def mean(values, mask=None):
+                keep = torch.isfinite(values)
+                if mask is not None:
+                    keep &= mask
+                return values[keep].float().mean().item() if keep.any() else float("nan")
+
+            all_positions = torch.cat([torch.arange(int(start) + 1, int(start) + scale + 1,
+                device=action.device) for start, scale in zip(interval_starts.tolist(), lengths)])
+            diagnostics = {
+                "episode_balanced_mode": 1,
+                "lava_sample_count": count,  # encoded positive paths, unchanged legacy meaning
+                "lava_sampled_anchor_count": count,
+                "lava_encoded_anchor_count": count,
+                "lava_scored_anchor_count": int(valid.sum()),
+                "lava_no_negative_anchor_count": int((~valid).sum()),
+                "lava_no_same_episode_count": int((same == 0).sum()),
+                "lava_no_cross_episode_count": int((cross == 0).sum()),
+                "same_episode_negative_count": same.float().mean().item(),
+                "cross_episode_negative_count": cross.float().mean().item(),
+                "same_episode_negative_min": int(same.min()),
+                "same_episode_negative_max": int(same.max()),
+                "cross_episode_negative_min": int(cross.min()),
+                "cross_episode_negative_max": int(cross.max()),
+                "negative_candidate_count": (same + cross).float().mean().item(),
+                "negative_candidate_availability": valid.float().mean().item(),
+                "lava_order_negative_count": 0,
+                "order_candidate_count": 0.0,
+                "state_endpoint_error": endpoint_error,
+                "pos_sim": positive_scores.mean().item(),
+                "negative_sim": mean(logits[:, 1:]),
+                "retrieval_acc": mean(accuracy), "candidate_acc": mean(accuracy),
+                "lava_position_mean": all_positions.float().mean().item(),
+                "lava_position_min": int(all_positions.min()),
+                "lava_position_max": int(all_positions.max()),
+                "lava_executed_path_ratio": ((interval_starts + torch.tensor(lengths, device=action.device))
+                                             < execution_horizon).float().mean().item(),
+            }
+            for modality, raw, calibrated, residuals in (
+                    ("action", action_levels, action_calibration, action_residuals),
+                    ("world", world_levels, world_calibration, world_residuals)):
+                norms = [torch.stack([level[k].norm() for level in raw]) for k in (0, 1)]
+                for k in (0, 1):
+                    diagnostics[f"{modality}_logsig_l{k + 1}_raw_norm"] = norms[k].mean().item()
+                    diagnostics[f"{modality}_logsig_l{k + 1}_calibrated_norm"] = mean(torch.stack([
+                        stats[f"level{k + 1}_calibrated_norm"] for stats in calibrated]))
+                energy = torch.stack([stats['level2_energy_fraction'] for stats in calibrated])
+                eligible = torch.tensor(lengths, device=action.device) >= 2
+                diagnostics[f"{modality}_logsig_l2_energy_fraction"] = mean(energy, eligible)
+                diagnostics[f"{modality}_logsig_l2_l1_ratio"] = mean(norms[1] / norms[0].clamp_min(1e-12), eligible)
+                flat = torch.cat(residuals)
+                diagnostics[f"{modality}_residual_norm"] = flat.float().norm(dim=-1).mean().item()
+                diagnostics[f"{modality}_residual_std"] = flat.float().std(unbiased=False).item()
+            for scale in (1, 2, 4, 8, 16):
+                mask = torch.tensor(lengths, device=action.device) == scale
+                diagnostics[f"loss_s{scale}"] = mean(losses, mask)
+                diagnostics[f"pos_sim_s{scale}"] = mean(positive_scores, mask)
+                diagnostics[f"candidate_acc_s{scale}"] = mean(accuracy, mask)
+            for label, mask in (("executed", interval_starts + torch.tensor(lengths, device=action.device) < execution_horizon),
+                                ("tail", interval_starts + torch.tensor(lengths, device=action.device) >= execution_horizon)):
+                diagnostics[f"loss_lava_{label}"] = mean(losses, mask)
+                diagnostics[f"candidate_acc_{label}"] = mean(accuracy, mask)
+            if contexts is not None:
+                gamma, beta = self.lava_world_encoder.film(
+                    self.lava_world_encoder.context_norm(contexts)).chunk(2, dim=-1)
+                diagnostics.update(film_gamma_rms=gamma.float().square().mean().sqrt().item(),
+                                   film_beta_rms=beta.float().square().mean().sqrt().item(),
+                                   film_context_count=count)
+            if soft_reference is not None:
+                mask = torch.ones_like(soft_reference, dtype=torch.bool)
+                first = self.lava_signature_calibrator.scale_to_index.get(1)
+                if first is not None:
+                    mask[:, 1, first] = False
+                rms = soft_reference[mask].sqrt()
+                diagnostics.update(signature_ema_rms_min=rms.min().item(), signature_ema_rms_max=rms.max().item())
+        return loss, diagnostics
+
     def compute_lava_loss(self, action_hidden, world_feature_differences,
                           batch_indices, interval_starts, interval_scales,
                           temperature=0.07, order_negative=True,
@@ -1110,7 +1325,9 @@ class VLAModel(nn.Module):
                           world_feature_paths=None,
                           temporal_negative_feature_paths=None,
                           far_negative_feature_paths=None,
-                          lava_context=None):
+                          lava_context=None,
+                          same_episode_negative_features=None,
+                          lava_episode_uids=None, lava_absolute_starts=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -1118,6 +1335,12 @@ class VLAModel(nn.Module):
         # the same local/far sampler but exposes every same-scale batch path as
         # an individual, unweighted candidate (including same-task paths).
         individual_batch_negatives = negative_mode == "mixed_batch"
+        episode_balanced = negative_mode == "episode_balanced"
+        if episode_balanced:
+            if order_negative or self.lava_action_similarity_weighting:
+                raise ValueError("episode_balanced requires order and action weighting disabled")
+            if self.lava_batch_negative_reduction != "sum":
+                raise ValueError("episode_balanced uses independent logits without batch averaging")
         if self.lava_batch_negative_reduction == "mean" and not individual_batch_negatives:
             raise ValueError("batch negative mean reduction requires mixed_batch")
         if individual_batch_negatives:
@@ -1177,7 +1400,7 @@ class VLAModel(nn.Module):
             )
             if any(value is None or len(value) != sample_count for value in required_paths):
                 raise ValueError("V5 requires one local and far action path per anchor")
-        if negative_mode not in {"batch", "episode_local", "mixed"}:
+        if negative_mode not in {"batch", "episode_local", "mixed", "episode_balanced"}:
             raise ValueError(
                 "negative_mode must be 'batch', 'episode_local', or 'mixed', "
                 f"got {negative_mode}")
@@ -1213,7 +1436,7 @@ class VLAModel(nn.Module):
         conditioned = self.lava_world_condition == "query_film"
         selected_contexts = None
         if conditioned:
-            if not individual_batch_negatives:
+            if not (individual_batch_negatives or episode_balanced):
                 raise ValueError("query_film currently requires mixed_batch negatives")
             if lava_context is None or lava_context.ndim != 2 or lava_context.shape[0] != action_hidden.shape[0]:
                 raise ValueError("query_film requires current-observation context for the policy batch")
@@ -1322,6 +1545,9 @@ class VLAModel(nn.Module):
             else None)
 
         def build_signature(levels, modality, scale):
+            if self.lava_signature_normalization == "graded_soft":
+                return graded_soft_logsignature(
+                    *levels, scale, depth=self.lava_logsig_depth, rho=self.lava_signature_rho)
             if soft_reference is not None:
                 return self.lava_signature_calibrator(
                     *levels, modality, scale, depth=self.lava_logsig_depth,
@@ -1373,6 +1599,15 @@ class VLAModel(nn.Module):
                 torch.cat((path, time_channel), dim=-1))
             return build_signature(levels, "world", scale)[0]
 
+        if episode_balanced:
+            return self._episode_balanced_objective(
+                action_signatures, world_signatures, paths[:sample_count],
+                same_episode_negative_features, lava_episode_uids, lava_absolute_starts,
+                lengths, selected_contexts, time_channels, calibrated_world_signature,
+                action_raw_levels, world_raw_levels, action_calibration, world_calibration,
+                action_residual_paths, world_residual_paths, interval_starts,
+                action_execution_horizon, state_endpoint_error, soft_reference, temperature)
+
         temporal_negative_signatures = []
         far_negative_signatures = []
         block_swap_signatures = []
@@ -1414,7 +1649,8 @@ class VLAModel(nn.Module):
         action_signatures = torch.stack(action_signatures)
         world_signatures = torch.stack(world_signatures)
         device = action_signatures.device
-        positive_values = (action_signatures * world_signatures).sum(dim=-1)
+        positive_values = lava_signature_score(
+            action_signatures, world_signatures, self.lava_signature_score)
         nan_value = action_signatures.new_tensor(float("nan"))
         same_task_negative_sim = nan_value.clone()
         cross_task_negative_sim = nan_value.clone()
@@ -1458,10 +1694,14 @@ class VLAModel(nn.Module):
                     row = encode_candidate_row(candidate_frames, context)
                 rows.append(row)
             candidate_signatures = torch.stack(rows)
-            positive_world_logits = torch.einsum(
+            positive_world_logits = (torch.einsum(
                 "id,ijd->ij", action_signatures, candidate_signatures)
+                if self.lava_signature_score == "dot" else lava_signature_score(
+                    action_signatures[:, None, :], candidate_signatures, self.lava_signature_score))
         else:
-            positive_world_logits = action_signatures @ world_signatures.transpose(0, 1)
+            positive_world_logits = (action_signatures @ world_signatures.transpose(0, 1)
+                if self.lava_signature_score == "dot" else lava_signature_score(
+                    action_signatures[:, None, :], world_signatures[None, :, :], self.lava_signature_score))
         if sample_count > 1:
             off_diagonal = ~torch.eye(
                 sample_count, dtype=torch.bool, device=device)
@@ -1483,8 +1723,8 @@ class VLAModel(nn.Module):
                 index_tensor = torch.as_tensor(
                     indices, device=device, dtype=torch.long)
                 stacked = torch.stack(signatures)
-                values[index_tensor] = (
-                    action_signatures[index_tensor] * stacked).sum(dim=-1)
+                values[index_tensor] = lava_signature_score(
+                    action_signatures[index_tensor], stacked, self.lava_signature_score)
             return values
 
         def family_logmeanexp(values):
@@ -1574,8 +1814,8 @@ class VLAModel(nn.Module):
 
         if negative_mode in {"episode_local", "mixed"}:
             temporal_negative_signatures = torch.stack(temporal_negative_signatures)
-            temporal_values = (
-                action_signatures * temporal_negative_signatures).sum(dim=-1)
+            temporal_values = lava_signature_score(
+                action_signatures, temporal_negative_signatures, self.lava_signature_score)
             temporal_negative_sim = temporal_values.mean()
             temporal_margin_per_sample = (positive_values - temporal_values).float()
             temporal_margin = temporal_margin_per_sample.mean()
@@ -1584,8 +1824,8 @@ class VLAModel(nn.Module):
                 world_signatures * temporal_negative_signatures).sum(dim=-1).mean()
             if negative_mode == "mixed":
                 far_negative_signatures = torch.stack(far_negative_signatures)
-                far_values = (
-                    action_signatures * far_negative_signatures).sum(dim=-1)
+                far_values = lava_signature_score(
+                    action_signatures, far_negative_signatures, self.lava_signature_score)
                 far_margin_per_sample = (positive_values - far_values).float()
                 positive_far_world_sim = (
                     world_signatures * far_negative_signatures).sum(dim=-1).mean()
@@ -2009,12 +2249,18 @@ class VLAModel(nn.Module):
             if block_swap_signatures:
                 logits = torch.cat((
                     logits,
-                    action_signatures @ torch.stack(block_swap_signatures).transpose(0, 1),
+                    (action_signatures @ torch.stack(block_swap_signatures).transpose(0, 1)
+                     if self.lava_signature_score == "dot" else lava_signature_score(
+                         action_signatures[:, None, :], torch.stack(block_swap_signatures)[None, :, :],
+                         self.lava_signature_score)),
                 ), dim=1)
             if derangement_signatures:
                 logits = torch.cat((
                     logits,
-                    action_signatures @ torch.stack(derangement_signatures).transpose(0, 1),
+                    (action_signatures @ torch.stack(derangement_signatures).transpose(0, 1)
+                     if self.lava_signature_score == "dot" else lava_signature_score(
+                         action_signatures[:, None, :], torch.stack(derangement_signatures)[None, :, :],
+                         self.lava_signature_score)),
                 ), dim=1)
             loss_lava_per_sample = F.cross_entropy(
                 logits / temperature, labels, reduction="none")
@@ -2503,6 +2749,9 @@ def calc_flow_matching_loss(
     far_negative_normalized_actions=None,
     far_negative_raw_actions=None,
     lava_context=None,
+    same_episode_negative_features=None,
+    lava_episode_uids=None,
+    lava_absolute_starts=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -2620,6 +2869,9 @@ def calc_flow_matching_loss(
         loss_lava, lava_diagnostics = model.compute_lava_loss(
             action_hidden=preds["action_hidden"],
             lava_context=lava_context,
+            same_episode_negative_features=same_episode_negative_features,
+            lava_episode_uids=lava_episode_uids,
+            lava_absolute_starts=lava_absolute_starts,
             world_feature_paths=world_feature_paths,
             temporal_negative_feature_paths=temporal_negative_feature_paths,
             far_negative_feature_paths=far_negative_feature_paths,
