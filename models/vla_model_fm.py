@@ -859,8 +859,8 @@ class VLAModel(nn.Module):
         if self.lava_signature_score not in {"dot", "neg_l2"}:
             raise ValueError("signature_score must be dot or neg_l2")
         if self.lava_signature_normalization == "graded_soft":
-            if self.lava_world_encoding != "state_delta" or self.lava_time_channel:
-                raise ValueError("graded_soft requires state_delta and no time channel")
+            if self.lava_world_encoding != "state_delta":
+                raise ValueError("graded_soft requires state_delta")
             if not math.isfinite(self.lava_signature_rho) or self.lava_signature_rho <= 0:
                 raise ValueError("graded_soft rho must be finite and positive")
         if self.lava_signature_normalization not in {
