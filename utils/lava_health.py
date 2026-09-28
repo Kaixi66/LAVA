@@ -19,6 +19,16 @@ class LAVAHealthMonitor:
         actual = int(info.get('lava_sample_count', 0))
         if actual != expected:
             raise RuntimeError(f'LAVA branch dropped supervision: dataset={expected}, loss={actual}')
+        if 'paired_hard_count' in info:
+            if (actual % 2 or info['paired_hard_count'] != 1
+                    or info['paired_world_path_count'] != actual
+                    or info['paired_cross_count'] != min(4, actual - 2)
+                    or info['paired_distance_over_l'] < 2):
+                raise RuntimeError('Invalid paired positive/candidate accounting')
+            for key in ('paired_hard_margin', 'paired_hard_probability',
+                        'paired_cross_probability', 'paired_positive_probability'):
+                if not math.isfinite(float(info[key])):
+                    raise RuntimeError(f'Non-finite paired diagnostic: {key}')
         if info.get('episode_balanced_mode'):
             sampled = int(info.get('lava_sampled_anchor_count', -1))
             encoded = int(info.get('lava_encoded_anchor_count', -1))

@@ -252,6 +252,14 @@ class LossLogger:
             ("T050_075", "t050_075"), ("T075_100", "t075_100"))),
         # Sampling, optimization, and system health
         ("LAVA_Samples", "lava_sample_count", "d"),
+        *(("Paired_" + name, "paired_" + key, ".6f") for name, key in (
+            ("Hard_Count", "hard_count"), ("Cross_Count", "cross_count"),
+            ("Hard_Acc", "hard_acc"), ("Hard_Margin", "hard_margin"),
+            ("Hard_Probability", "hard_probability"),
+            ("Cross_Probability", "cross_probability"),
+            ("Positive_Probability", "positive_probability"),
+            ("Candidate_Acc", "candidate_acc"), ("World_Path_Count", "world_path_count"),
+            ("Distance_Over_L", "distance_over_l"))),
         ("Episode_Balanced_Mode", "episode_balanced_mode", "d"),
         ("LAVA_Sampled_Anchors", "lava_sampled_anchor_count", "d"),
         ("LAVA_Encoded_Anchors", "lava_encoded_anchor_count", "d"),
@@ -917,9 +925,15 @@ if __name__ == "__main__":
     if (use_lava
             and str(config.training.get('lava_scale_sampling', 'uniform'))
             == 'batch_uniform'):
-        lava_batch_sampler = LAVABatchScaleBatchSampler(
-            len(train_dataset), batch_size,
-            tuple(config.training.lava_scales), seed=seed, drop_last=True)
+        if config.training.get('lava_negative_mode') == 'paired_batch':
+            from dataloader.lava_paired import LAVAPairedBatchSampler
+            lava_batch_sampler = LAVAPairedBatchSampler(
+                train_dataset, batch_size, tuple(config.training.lava_scales),
+                seed=seed, drop_last=True)
+        else:
+            lava_batch_sampler = LAVABatchScaleBatchSampler(
+                len(train_dataset), batch_size,
+                tuple(config.training.lava_scales), seed=seed, drop_last=True)
         train_dataloader = DataLoader(
             train_dataset,
             batch_sampler=lava_batch_sampler,

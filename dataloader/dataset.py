@@ -270,7 +270,7 @@ class RobotWinTaskDataset(data.Dataset):
                 raise ValueError(
                     "lava_sampling_balance must be one of 'none', 'task', or "
                     f"'task_episode', got {self.lava_sampling_balance}")
-            if self.lava_negative_mode not in {"batch", "episode_local", "mixed", "mixed_batch", "episode_balanced"}:
+            if self.lava_negative_mode not in {"batch", "paired_batch", "episode_local", "mixed", "mixed_batch", "episode_balanced"}:
                 raise ValueError(
                     "lava_negative_mode must be 'batch', 'episode_local', "
                     "'mixed', or 'mixed_batch', got "
@@ -832,6 +832,8 @@ class RobotWinTaskDataset(data.Dataset):
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         forced_scale = None
+        paired_request = isinstance(idx, (tuple, list)) and len(idx) == 3
+        forced_start = idx[2] if paired_request else None
         if isinstance(idx, (tuple, list)):
             idx, forced_scale = int(idx[0]), int(idx[1])
         global_curr_idx = self.valid_indices[idx]
@@ -851,7 +853,15 @@ class RobotWinTaskDataset(data.Dataset):
             lava_interval = None
             lava_pair = None
             same_episode_starts = []
-            if self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
+            if self.lava_negative_mode == 'paired_batch':
+                if not paired_request:
+                    raise ValueError('paired_batch requires LAVAPairedBatchSampler')
+                if forced_start is not None:
+                    lava_interval = (int(forced_start), forced_scale)
+                    if not (0 <= forced_start and forced_start + forced_scale < self.chunk_size
+                            and local_anchor_idx + forced_start + forced_scale < total_frames):
+                        raise ValueError('Invalid forced paired interval')
+            elif self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
                 lava_pair = self._sample_lava_contrastive_pair(
                     local_anchor_idx, total_frames, episode_idx=ep_idx,
                     forced_scale=forced_scale)
@@ -965,7 +975,7 @@ class RobotWinTaskDataset(data.Dataset):
                 result['evolution_pixel_values'] = torch.from_numpy(evolution_normed).float()
                 result['evolution_start'] = lava_start
                 result['evolution_scale'] = lava_scale
-                if self.lava_negative_mode == "episode_balanced":
+                if self.lava_negative_mode in {"episode_balanced", "paired_batch"}:
                     result['evolution_episode_uid'] = os.path.realpath(ep_meta['hdf5_path'])
                     result['evolution_absolute_start'] = int(local_anchor_idx + lava_start)
                     result['evolution_observation_start'] = int(local_anchor_idx)

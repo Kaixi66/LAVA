@@ -248,7 +248,7 @@ class VLAWrapper(nn.Module):
             if self.lava_negative_mode == 'episode_balanced':
                 if self.lava_order_negative or self.lava_action_similarity_weighting:
                     raise ValueError('episode_balanced requires order and action weighting disabled')
-            if self.lava_negative_mode not in {'batch', 'episode_local', 'mixed', 'mixed_batch', 'episode_balanced'}:
+            if self.lava_negative_mode not in {'batch', 'paired_batch', 'episode_local', 'mixed', 'mixed_batch', 'episode_balanced'}:
                 raise ValueError(
                     "lava_negative_mode must be 'batch', 'episode_local', "
                     "'mixed', or 'mixed_batch', got "

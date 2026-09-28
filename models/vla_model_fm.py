@@ -1335,6 +1335,12 @@ class VLAModel(nn.Module):
         # the same local/far sampler but exposes every same-scale batch path as
         # an individual, unweighted candidate (including same-task paths).
         individual_batch_negatives = negative_mode == "mixed_batch"
+        paired_batch = negative_mode == "paired_batch"
+        paired_diagnostics = {}
+        if paired_batch:
+            if order_negative or self.lava_action_similarity_weighting or self.lava_world_encoder.use_query_film:
+                raise ValueError("paired_batch requires order, action weighting and FiLM disabled")
+            negative_mode = "batch"
         episode_balanced = negative_mode == "episode_balanced"
         if episode_balanced:
             if order_negative or self.lava_action_similarity_weighting:
@@ -2243,9 +2249,38 @@ class VLAModel(nn.Module):
         else:
             logits = positive_world_logits
             labels = torch.arange(sample_count, device=device)
+            if paired_batch:
+                from dataloader.lava_paired import paired_candidate_indices
+                if lava_episode_uids is None or lava_absolute_starts is None:
+                    raise ValueError('paired_batch requires episode and interval metadata')
+                candidates = paired_candidate_indices(
+                    lava_episode_uids, lava_absolute_starts, lengths, device)
+                logits = positive_world_logits.gather(1, candidates.clamp_min(0))
+                logits = logits.masked_fill(candidates < 0, -torch.inf)
+                labels = torch.zeros(sample_count, dtype=torch.long, device=device)
+                with torch.no_grad():
+                    probs = (logits.float() / temperature).softmax(dim=1)
+                    paired_diagnostics = {
+                        'paired_hard_count': 1.0,
+                        'paired_cross_count': (candidates[:, 2:] >= 0).float().sum(1).mean().item(),
+                        'paired_hard_acc': (logits[:, 0] > logits[:, 1]).float().mean().item(),
+                        'paired_hard_margin': (logits[:, 0] - logits[:, 1]).float().mean().item(),
+                        'paired_hard_probability': probs[:, 1].mean().item(),
+                        'paired_cross_probability': probs[:, 2:].sum(1).mean().item(),
+                        'paired_positive_probability': probs[:, 0].mean().item(),
+                        'paired_candidate_acc': (logits.argmax(1) == 0).float().mean().item(),
+                        'paired_world_path_count': sample_count,
+                        'paired_distance_over_l': sum(
+                            abs(int(lava_absolute_starts[i]) - int(lava_absolute_starts[int(candidates[i, 1])])) / lengths[i]
+                            for i in range(sample_count)) / sample_count,
+                    }
+                candidate_accuracy = (logits.argmax(1) == labels).float().mean()
+                candidate_correct_per_sample = (logits.argmax(1) == labels).float()
             negative_sim = (
                 positive_world_logits[off_diagonal].mean()
                 if off_diagonal.any() else action_signatures.new_tensor(0.0))
+            if paired_batch:
+                negative_sim = logits[:, 1:][torch.isfinite(logits[:, 1:])].mean()
             if block_swap_signatures:
                 logits = torch.cat((
                     logits,
@@ -2670,6 +2705,7 @@ class VLAModel(nn.Module):
             # not the number of corruption candidates inside the order family.
             "lava_order_negative_count": len(block_action_indices),
         })
+        diagnostics.update(paired_diagnostics)
         if conditioned:
             with torch.no_grad():
                 gamma, beta = self.lava_world_encoder.film(
