@@ -36,6 +36,42 @@ def load_config(config_path):
     return OmegaConf.load(config_path)
 
 
+EB_FAMILY_METRICS = (
+    ("Positive_Probability", "positive_probability"),
+    ("Same_Episode_Probability", "same_episode_probability"),
+    ("Cross_Episode_Probability", "cross_episode_probability"),
+    ("Same_Episode_Prob_Per_Candidate", "same_episode_probability_per_candidate"),
+    ("Cross_Episode_Prob_Per_Candidate", "cross_episode_probability_per_candidate"),
+    ("Same_Episode_Mass_Fraction", "same_episode_mass_fraction"),
+    ("Same_Episode_Mass_Uniform", "same_episode_mass_uniform"),
+    ("Hardest_Is_Same_Episode", "hardest_is_same_episode"),
+    ("Same_Episode_Acc", "same_episode_acc"),
+    ("Cross_Episode_Acc", "cross_episode_acc"),
+    ("Same_Episode_Margin", "same_episode_margin"),
+    ("Cross_Episode_Margin", "cross_episode_margin"),
+    ("Same_Episode_Distance_Over_L", "same_episode_distance_over_l"),
+    ("Same_Episode_Distance_Over_L_Min", "same_episode_distance_over_l_min"),
+    ("Same_Task_Cross_Fraction", "same_task_cross_fraction"),
+    ("Same_Task_Cross_Acc", "same_task_cross_acc"),
+    ("Cross_Task_Cross_Acc", "cross_task_cross_acc"),
+    ("Same_Task_Cross_Prob_Per_Candidate", "same_task_cross_probability_per_candidate"),
+    ("Cross_Task_Cross_Prob_Per_Candidate", "cross_task_cross_probability_per_candidate"),
+    ("EB_World_Path_Count", "episode_balanced_world_path_count"),
+    *((f"Same_Episode_Acc_{band.capitalize()}", f"same_episode_acc_{band}") for band in ("near", "mid", "far")),
+    *((f"Same_Episode_Band_Fraction_{band.capitalize()}", f"same_episode_band_fraction_{band}")
+      for band in ("near", "mid", "far")),
+    *((f"Same_Episode_Sampled_{band.capitalize()}", f"same_episode_sampled_{band}")
+      for band in ("near", "mid", "far", "none")),
+    ("Same_Episode_Rejected_Fraction", "same_episode_rejected_fraction"),
+    ("Same_Episode_Action_Rel", "same_episode_action_rel"),
+    *((f"{name}_S{scale}", f"{key}_s{scale}") for scale in (1, 2, 4, 8, 16)
+      for name, key in (("Same_Episode_Mass_Fraction", "same_episode_mass_fraction"),
+                        ("Hardest_Is_Same_Episode", "hardest_is_same_episode"),
+                        ("Same_Episode_Acc", "same_episode_acc"),
+                        ("Cross_Episode_Acc", "cross_episode_acc"))),
+)
+
+
 class LossLogger:
     METRICS = (
         # Base objectives and global LAVA correspondence
@@ -274,6 +310,8 @@ class LossLogger:
             ("Positive_Probability", "positive_probability"),
             ("Candidate_Acc", "candidate_acc"), ("World_Path_Count", "world_path_count"),
             ("Distance_Over_L", "distance_over_l"))),
+        # Episode-balanced family-resolved competition (V7.11 monitoring)
+        *((name, key, ".6f") for name, key in EB_FAMILY_METRICS),
         ("Episode_Balanced_Mode", "episode_balanced_mode", "d"),
         ("LAVA_Sampled_Anchors", "lava_sampled_anchor_count", "d"),
         ("LAVA_Encoded_Anchors", "lava_encoded_anchor_count", "d"),
@@ -365,6 +403,7 @@ class LossLogger:
     )
 
     NAN_DEFAULT_KEYS = {
+        *(key for _, key in EB_FAMILY_METRICS),
         "state_endpoint_error", "order_signature_distance", "order_equivalent_fraction",
         "batch_candidate_count", "same_task_batch_candidate_count",
         "negative_candidate_count", "batch_margin", "batch_acc",

@@ -855,6 +855,7 @@ class VLAModel(nn.Module):
                  lava_action_similarity_weighting=False,
                  lava_batch_negative_reduction="sum",
                  lava_num_cross_episode_negatives=4,
+                 lava_reuse_world_signatures=False,
                  lava_action_component_calibration=False,
                  lava_action_similarity_min_weight=0.1,
                  lava_action_similarity_beta_momentum=0.99,
@@ -934,6 +935,12 @@ class VLAModel(nn.Module):
         self.lava_num_cross_episode_negatives = int(lava_num_cross_episode_negatives)
         if not 0 <= self.lava_num_cross_episode_negatives <= 4:
             raise ValueError("episode_balanced requires 0..4 cross-episode negatives")
+        # Without query FiLM a candidate's world signature is anchor-independent, so
+        # episode_balanced can reuse positive signatures for cross candidates and
+        # encode all same-episode paths in one batch (numerically the same objective).
+        self.lava_reuse_world_signatures = bool(lava_reuse_world_signatures)
+        if self.lava_reuse_world_signatures and self.lava_world_condition == "query_film":
+            raise ValueError("lava_reuse_world_signatures requires world_condition disabled")
         if self.lava_batch_negative_reduction not in {"sum", "mean"}:
             raise ValueError("lava_batch_negative_reduction must be sum or mean")
         self.lava_action_component_calibration = bool(
@@ -1230,7 +1237,8 @@ class VLAModel(nn.Module):
             same_paths, episode_uids, absolute_starts, lengths, contexts,
             time_channels, build_world_signature, action_levels, world_levels,
             action_calibration, world_calibration, action_residuals, world_residuals,
-            interval_starts, execution_horizon, endpoint_error, soft_reference, temperature):
+            interval_starts, execution_horizon, endpoint_error, soft_reference, temperature,
+            anchor_task_names=None, same_distance_ratios=None):
         """Independent 0..4 same-episode + 0..4 cross-episode candidate logits."""
         count = len(positive_paths)
         if same_paths is None or len(same_paths) != count:
@@ -1253,6 +1261,23 @@ class VLAModel(nn.Module):
             base_positive_scores = lava_signature_score(
                 action[:, :base_width], world[:, :base_width], self.lava_signature_score)
         state_mode = self.lava_world_encoding == "state_delta"
+        reuse = self.lava_reuse_world_signatures
+        if reuse:
+            if contexts is not None:
+                raise ValueError("Reused world signatures are anchor-independent; FiLM must be off")
+            # One batched encoding of every same-episode path; cross candidates below
+            # reuse the already-encoded, differentiable positive signatures.
+            owners = [i for i, group in enumerate(same_paths) for _ in group]
+            same_flat = [path for group in same_paths for path in group]
+            if any(path.shape[0] != lengths[i] + int(state_mode) for i, path in zip(owners, same_flat)):
+                raise ValueError("episode_balanced candidate length does not match anchor scale")
+            same_signatures = [[] for _ in same_paths]
+            if same_flat:
+                states = self.lava_world_encoder(torch.cat([
+                    path.to(device=action.device, dtype=positive_paths[0].dtype) for path in same_flat]))
+                for i, path in zip(owners, states.split([path.shape[0] for path in same_flat])):
+                    same_signatures[i].append(build_world_signature(
+                        path[1:] - path[:-1] if state_mode else path, time_channels[i], lengths[i]))
         for i, scale in enumerate(lengths):
             candidates = list(same_paths[i]) + [positive_paths[j] for j in cross_indices[i]]
             same_counts.append(len(same_paths[i]))
@@ -1265,21 +1290,24 @@ class VLAModel(nn.Module):
             path_length = scale + int(state_mode)
             if any(path.shape[0] != path_length for path in candidates):
                 raise ValueError("episode_balanced candidate length does not match anchor scale")
-            frames = torch.cat([path.to(device=action.device, dtype=positive_paths[i].dtype)
-                                for path in candidates])
-            context = contexts[i] if contexts is not None else action.new_empty(0)
+            if reuse:
+                signatures = torch.stack(same_signatures[i] + [world[j] for j in cross_indices[i]])
+            else:
+                frames = torch.cat([path.to(device=action.device, dtype=positive_paths[i].dtype)
+                                    for path in candidates])
+                context = contexts[i] if contexts is not None else action.new_empty(0)
 
-            def encode_row(frames, context, path_length=path_length, scale=scale,
-                           time=time_channels[i], conditioned=contexts is not None):
-                states = (self.lava_world_encoder(frames, context=context[None].expand(len(frames), -1))
-                          if conditioned else self.lava_world_encoder(frames))
-                return torch.stack([build_world_signature(
-                    path[1:] - path[:-1] if state_mode else path, time, scale)
-                    for path in states.split(path_length)])
+                def encode_row(frames, context, path_length=path_length, scale=scale,
+                               time=time_channels[i], conditioned=contexts is not None):
+                    states = (self.lava_world_encoder(frames, context=context[None].expand(len(frames), -1))
+                              if conditioned else self.lava_world_encoder(frames))
+                    return torch.stack([build_world_signature(
+                        path[1:] - path[:-1] if state_mode else path, time, scale)
+                        for path in states.split(path_length)])
 
-            signatures = (checkpoint(encode_row, frames, context, use_reentrant=False,
-                                     preserve_rng_state=False)
-                          if torch.is_grad_enabled() else encode_row(frames, context))
+                signatures = (checkpoint(encode_row, frames, context, use_reentrant=False,
+                                         preserve_rng_state=False)
+                              if torch.is_grad_enabled() else encode_row(frames, context))
             negative_scores = lava_signature_score(action[i], signatures, self.lava_signature_score)
             rows.append(torch.cat((positive_scores[i:i + 1], negative_scores)))
             if self.lava_projected_third_order:
@@ -1392,6 +1420,80 @@ class VLAModel(nn.Module):
                         stats["level3_energy_fraction"] for stats in world_calibration])
                     diagnostics[f"third_action_energy_fraction_s{scale}"] = mean(action_third_energy, mask)
                     diagnostics[f"third_world_energy_fraction_s{scale}"] = mean(world_third_energy, mask)
+            # Family-resolved competition: softmax shares at the logit level, not
+            # parameter-gradient fractions. Uniform exchangeable candidates give
+            # mass fraction = same/(same+cross) and hardest-is-same = same/(same+cross).
+            columns = torch.arange(width, device=action.device)[None]
+            same_mask = (columns >= 1) & (columns < 1 + same[:, None])
+            cross_mask = (columns >= 1 + same[:, None]) & (columns < 1 + (same + cross)[:, None])
+            scores = logits.float()
+            probability = torch.softmax(scores / temperature, dim=1)
+            positive = scores[:, 0]
+            missing = torch.full_like(scores, -torch.inf)
+            max_same = torch.where(same_mask, scores, missing).max(1).values
+            max_cross = torch.where(cross_mask, scores, missing).max(1).values
+            p_same = (probability * same_mask).sum(1)
+            p_cross = (probability * cross_mask).sum(1)
+            has_same, has_cross = same > 0, cross > 0
+            both = has_same & has_cross
+            lengths_tensor = torch.tensor(lengths, device=action.device)
+
+            def share(numerator, denominator, mask):
+                total = denominator[mask].sum()
+                return (numerator[mask].sum() / total).item() if mask.any() and total > 0 else float("nan")
+
+            def per_candidate(mask):
+                return ((probability * mask).sum() / mask.sum()).item() if mask.any() else float("nan")
+
+            diagnostics.update({
+                "positive_probability": mean(probability[:, 0], valid),
+                "same_episode_probability": mean(p_same, has_same),
+                "cross_episode_probability": mean(p_cross, has_cross),
+                "same_episode_probability_per_candidate": per_candidate(same_mask),
+                "cross_episode_probability_per_candidate": per_candidate(cross_mask),
+                "same_episode_mass_fraction": share(p_same, p_same + p_cross, both),
+                "same_episode_mass_uniform": share(same.float(), (same + cross).float(), both),
+                "hardest_is_same_episode": mean((max_same > max_cross).float(), both),
+                "same_episode_acc": mean((positive > max_same).float(), has_same),
+                "cross_episode_acc": mean((positive > max_cross).float(), has_cross),
+                "same_episode_margin": mean(positive - max_same, has_same),
+                "cross_episode_margin": mean(positive - max_cross, has_cross),
+                # Paths passed through the world Q-Former this step (positives included).
+                "episode_balanced_world_path_count": count + int(same.sum()) + (
+                    0 if self.lava_reuse_world_signatures else int(cross.sum())),
+            })
+            for scale in (1, 2, 4, 8, 16):
+                mask = lengths_tensor == scale
+                diagnostics[f"same_episode_mass_fraction_s{scale}"] = share(p_same, p_same + p_cross, both & mask)
+                diagnostics[f"hardest_is_same_episode_s{scale}"] = mean((max_same > max_cross).float(), both & mask)
+                diagnostics[f"same_episode_acc_s{scale}"] = mean((positive > max_same).float(), has_same & mask)
+                diagnostics[f"cross_episode_acc_s{scale}"] = mean((positive > max_cross).float(), has_cross & mask)
+            if same_distance_ratios is not None:
+                # Per same-episode candidate accuracy by |dt|/L band: near [2,4), mid [4,8), far >=8.
+                for name, lo, hi in (("near", 2, 4), ("mid", 4, 8), ("far", 8, math.inf)):
+                    hits = [float(positive[i] > scores[i, 1 + k])
+                            for i, ratios in enumerate(same_distance_ratios)
+                            for k, ratio in enumerate(ratios[:int(same[i])]) if lo <= ratio < hi]
+                    diagnostics[f"same_episode_acc_{name}"] = sum(hits) / len(hits) if hits else float("nan")
+                    diagnostics[f"same_episode_band_fraction_{name}"] = len(hits) / max(int(same.sum()), 1)
+            if anchor_task_names is not None:
+                # Same-task cross-episode candidates need dynamics; cross-task ones can be
+                # separated by task/scene identity alone.
+                same_task_mask = torch.zeros_like(cross_mask)
+                for i, row in enumerate(cross_indices):
+                    for k, j in enumerate(row):
+                        if anchor_task_names[j] == anchor_task_names[i]:
+                            same_task_mask[i, 1 + int(same[i]) + k] = True
+                cross_task_mask = cross_mask & ~same_task_mask
+                max_same_task = torch.where(same_task_mask, scores, missing).max(1).values
+                max_cross_task = torch.where(cross_task_mask, scores, missing).max(1).values
+                diagnostics.update({
+                    "same_task_cross_fraction": (same_task_mask.sum() / cross_mask.sum().clamp_min(1)).item(),
+                    "same_task_cross_acc": mean((positive > max_same_task).float(), same_task_mask.any(1)),
+                    "cross_task_cross_acc": mean((positive > max_cross_task).float(), cross_task_mask.any(1)),
+                    "same_task_cross_probability_per_candidate": per_candidate(same_task_mask),
+                    "cross_task_cross_probability_per_candidate": per_candidate(cross_task_mask),
+                })
             for label, mask in (("executed", interval_starts + torch.tensor(lengths, device=action.device) < execution_horizon),
                                 ("tail", interval_starts + torch.tensor(lengths, device=action.device) >= execution_horizon)):
                 diagnostics[f"loss_lava_{label}"] = mean(losses, mask)
@@ -1429,7 +1531,8 @@ class VLAModel(nn.Module):
                           far_negative_feature_paths=None,
                           lava_context=None,
                           same_episode_negative_features=None,
-                          lava_episode_uids=None, lava_absolute_starts=None):
+                          lava_episode_uids=None, lava_absolute_starts=None,
+                          same_episode_distance_ratios=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -1739,7 +1842,10 @@ class VLAModel(nn.Module):
                 lengths, selected_contexts, time_channels, calibrated_world_signature,
                 action_raw_levels, world_raw_levels, action_calibration, world_calibration,
                 action_residual_paths, world_residual_paths, interval_starts,
-                action_execution_horizon, state_endpoint_error, soft_reference, temperature)
+                action_execution_horizon, state_endpoint_error, soft_reference, temperature,
+                anchor_task_names=(None if task_names is None else
+                                   [task_names[index] for index in batch_indices.tolist()]),
+                same_distance_ratios=same_episode_distance_ratios)
 
         temporal_negative_signatures = []
         far_negative_signatures = []
@@ -2915,6 +3021,7 @@ def calc_flow_matching_loss(
     same_episode_negative_features=None,
     lava_episode_uids=None,
     lava_absolute_starts=None,
+    lava_same_episode_distance_ratios=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -3035,6 +3142,7 @@ def calc_flow_matching_loss(
             same_episode_negative_features=same_episode_negative_features,
             lava_episode_uids=lava_episode_uids,
             lava_absolute_starts=lava_absolute_starts,
+            same_episode_distance_ratios=lava_same_episode_distance_ratios,
             world_feature_paths=world_feature_paths,
             temporal_negative_feature_paths=temporal_negative_feature_paths,
             far_negative_feature_paths=far_negative_feature_paths,

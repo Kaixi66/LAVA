@@ -1,4 +1,5 @@
 import copy
+import numpy as np
 import math
 import random
 import sys
@@ -248,3 +249,184 @@ def test_zero_candidates_leave_full_policy_flow_and_future_loss_unchanged():
     actual.backward()
     assert model.output_proj.weight.grad.norm() > 0
     assert model.future_feat_decoder.weight.grad.norm() > 0
+
+
+@pytest.mark.parametrize('scale', [1, 2, 4, 8, 16])
+def test_one_same_episode_family_diagnostics_match_logits(scale):
+    torch.manual_seed(711)
+    model = small_soft_model()
+    tasks = ['task_a'] * 5 + ['task_b'] * 4
+    kw = balanced_inputs((scale,) * 9, (1,) * 9)
+    kw.update(action_hidden=torch.randn(9, 17, 32, requires_grad=True),
+              batch_indices=torch.arange(9), interval_starts=torch.zeros(9, dtype=torch.long),
+              lava_context=torch.randn(9, 16), task_names=tasks,
+              lava_episode_uids=[f'/{task}/episode{i}' for i, task in enumerate(tasks)],
+              lava_absolute_starts=[0] * 9)
+    loss, info, captured = capture_objective(model, kw)
+    logits = captured['logits'].float()
+    assert logits.shape == (9, 6) and torch.isfinite(logits).all()
+    p = torch.softmax(logits / .07, dim=1)
+    torch.testing.assert_close(info['same_episode_mass_fraction'],
+                               (p[:, 1].sum() / p[:, 1:].sum()).item(), rtol=1e-5, atol=1e-6)
+    assert info['same_episode_mass_uniform'] == pytest.approx(0.2)
+    hardest = (logits[:, 1] > logits[:, 2:].max(1).values).float().mean().item()
+    assert info['hardest_is_same_episode'] == pytest.approx(hardest)
+    assert info[f'hardest_is_same_episode_s{scale}'] == pytest.approx(hardest)
+    assert info['same_episode_acc'] == pytest.approx((logits[:, 0] > logits[:, 1]).float().mean().item())
+    assert info['cross_episode_acc'] == pytest.approx(
+        (logits[:, 0] > logits[:, 2:].max(1).values).float().mean().item())
+    same_task = [[tasks[j] == tasks[i] for j in row] for i, row in enumerate(captured['cross_indices'])]
+    fraction = sum(map(sum, same_task)) / sum(map(len, same_task))
+    assert info['same_task_cross_fraction'] == pytest.approx(fraction)
+    for key in ('positive_probability', 'same_task_cross_acc', 'cross_task_cross_acc',
+                'same_episode_probability_per_candidate', 'cross_episode_probability_per_candidate'):
+        assert math.isfinite(info[key])
+    (.01 * loss).backward()
+    assert kw['action_hidden'].grad is not None and kw['action_hidden'].grad.norm() > 0
+
+
+def v712_model(reuse):
+    from models.vla_model_fm import VLAModel
+    return VLAModel(
+        action_dim=14, proprio_dim=2, hidden_dim=32, num_heads=4, depth=1,
+        action_len=17, proprio_len=1, num_registers=0,
+        dino_feat_dims=(16,), vlm_num_queries=2, adapter_depth=1,
+        use_future_feat=False, use_lava=True, lava_dino_feat_dim=16,
+        lava_world_encoding="state_delta", lava_time_channel=True,
+        lava_world_condition="none", lava_residual_dim=128, lava_query_dim=16,
+        lava_qformer_hidden_dim=32, lava_qformer_num_queries=8,
+        lava_qformer_num_layers=2, lava_qformer_num_heads=4,
+        lava_signature_normalization="graded_soft", lava_signature_score="neg_l2",
+        lava_reuse_world_signatures=reuse)
+
+
+@pytest.mark.parametrize('scale', [1, 2, 4, 8, 16])
+def test_reused_world_signatures_match_per_anchor_encoding(scale):
+    torch.manual_seed(712)
+    slow, fast = v712_model(False), v712_model(True)
+    fast.load_state_dict(slow.state_dict())
+    tasks = ['task_a'] * 5 + ['task_b'] * 4
+    kw = balanced_inputs((scale,) * 9, (1, 1, 1, 1, 0, 1, 1, 1, 1))
+    kw.pop('lava_context')
+    kw.update(batch_indices=torch.arange(9), interval_starts=torch.zeros(9, dtype=torch.long),
+              task_names=tasks, lava_absolute_starts=[0] * 9,
+              lava_episode_uids=[f'/{task}/episode{i}' for i, task in enumerate(tasks)])
+    hidden = torch.randn(9, 17, 32)
+    results = []
+    for model in (slow, fast):
+        calls = []
+        handle = model.lava_world_encoder.register_forward_hook(lambda *args: calls.append(1))
+        kw['action_hidden'] = hidden.clone().requires_grad_()
+        torch.manual_seed(7)  # identical cross-episode candidate draws
+        loss, info, captured = capture_objective(model, kw)
+        loss.backward()
+        handle.remove()
+        results.append((loss, info, captured, kw['action_hidden'].grad, len(calls),
+                        {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}))
+    (l0, i0, c0, g0, n0, p0), (l1, i1, c1, g1, n1, p1) = results
+    assert c0['cross_indices'] == c1['cross_indices']
+    torch.testing.assert_close(c0['logits'], c1['logits'], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(l0, l1, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(g0, g1, rtol=1e-4, atol=1e-6)
+    assert set(p0) == set(p1) and any('lava_world_encoder' in n for n in p1)
+    for name in p0:
+        torch.testing.assert_close(p0[name], p1[name], rtol=1e-4, atol=1e-5)  # summation order only
+    # Old path: positives + per-anchor rows, each row recomputed once more by checkpointing.
+    assert n1 == 2 and n0 == 1 + 2 * 9
+    assert i1['episode_balanced_world_path_count'] == 9 + 8
+    assert i0['episode_balanced_world_path_count'] == 9 + 8 + sum(c0['cross_counts'])
+
+
+def test_reuse_rejects_query_film():
+    from models.vla_model_fm import VLAModel
+    with pytest.raises(ValueError, match='requires world_condition disabled'):
+        VLAModel(action_dim=14, proprio_dim=2, hidden_dim=32, num_heads=4, depth=1,
+                 action_len=17, proprio_len=1, num_registers=0, dino_feat_dims=(16,),
+                 vlm_num_queries=2, adapter_depth=1, use_future_feat=False, use_lava=True,
+                 lava_dino_feat_dim=16, lava_world_encoding="state_delta",
+                 lava_world_condition="query_film", lava_residual_dim=128, lava_query_dim=16,
+                 lava_qformer_hidden_dim=32, lava_qformer_num_queries=8,
+                 lava_reuse_world_signatures=True)
+
+
+def near_filtered_dataset(root):
+    from dataloader.dataset import RobotWinTaskDataset
+    return RobotWinTaskDataset(root,
+        indices_config=dict(state_indices=[0], action_indices=list(range(32)), camera_indices=[0]),
+        camera_names=['head_camera'], image_size=(16, 16), task_set='all',
+        use_lava=True, lava_sample_ratio=1., lava_negative_mode='episode_balanced',
+        lava_num_same_episode_negatives=1, lava_same_episode_sampling='near_filtered')
+
+
+@pytest.mark.parametrize('scale', [1, 2, 4, 8, 16])
+def test_near_filtered_prefers_nearest_behaviourally_different_start(episode_root, scale):
+    dataset = near_filtered_dataset(episode_root)
+    path = dataset.episode_metadata[0]['hdf5_path']
+    rng = np.random.default_rng(scale)
+    dataset._episode_action_cache[path] = rng.normal(size=(128, 14)).astype('float32')
+    position = 60
+    for _ in range(10):
+        starts, info = dataset._sample_near_filtered_start(position, scale, 128, path)
+        assert len(starts) == 1 and info['band'] == 0
+        assert 2 * scale <= abs(starts[0] - position) < 4 * scale
+        assert info['action_rel'] >= 0.25
+        assert info['action_rel'] == pytest.approx(
+            dataset._action_relation(dataset._episode_action_cache[path], position, starts[0], scale))
+
+
+@pytest.mark.parametrize('scale', [1, 2, 4])
+def test_near_filtered_rejects_identical_motion_and_falls_back(episode_root, scale):
+    dataset = near_filtered_dataset(episode_root)
+    path = dataset.episode_metadata[0]['hdf5_path']
+    actions = np.random.default_rng(0).normal(size=(128, 14)).astype('float32')
+    actions[:96] = np.arange(96, dtype='float32')[:, None] * 0.1  # constant velocity: identical motion
+    dataset._episode_action_cache[path] = actions
+    position = 30  # near and mid bands lie wholly in the constant-velocity segment
+    for _ in range(10):
+        starts, info = dataset._sample_near_filtered_start(position, scale, 128, path)
+        assert info['band'] == 2 and info['rejected'] > 0
+        assert abs(starts[0] - position) >= 8 * scale and info['action_rel'] >= 0.25
+    dataset._episode_action_cache[path] = np.arange(128, dtype='float32')[:, None].repeat(14, 1)
+    starts, info = dataset._sample_near_filtered_start(position, scale, 128, path)
+    assert starts == [] and info['band'] == -1 and info['rejected'] == info['checked'] > 0
+
+
+def test_near_filtered_sample_and_collate_carry_sampling_info(episode_root):
+    dataset = near_filtered_dataset(episode_root)
+    samples = [dataset[(i, 2)] for i in range(3)]
+    for sample in samples:
+        assert len(sample['same_episode_negative_starts']) <= 1
+        assert set(sample['same_episode_sampling_info']) == {'band', 'action_rel', 'rejected', 'checked'}
+    batch = collate_fn(samples)
+    assert len(batch['same_episode_sampling_info']) == 3
+    uniform = make_dataset(episode_root, mode='episode_balanced')
+    assert 'same_episode_sampling_info' not in uniform[(0, 2)]
+    assert collate_fn([uniform[(0, 2)]])['same_episode_sampling_info'] == [None]
+
+
+def test_near_filtered_requires_exactly_one_negative(episode_root):
+    from dataloader.dataset import RobotWinTaskDataset
+    with pytest.raises(ValueError, match='exactly one'):
+        RobotWinTaskDataset(episode_root,
+            indices_config=dict(state_indices=[0], action_indices=list(range(32)), camera_indices=[0]),
+            camera_names=['head_camera'], image_size=(16, 16), task_set='all', use_lava=True,
+            lava_negative_mode='episode_balanced', lava_same_episode_sampling='near_filtered')
+
+
+def test_band_accuracy_diagnostics_match_logits():
+    torch.manual_seed(713)
+    model = v712_model(True)
+    tasks = ['task_a'] * 5 + ['task_b'] * 4
+    kw = balanced_inputs((4,) * 9, (1,) * 9)
+    kw.pop('lava_context')
+    ratios = [[2.5], [3.0], [5.0], [6.0], [7.5], [9.0], [20.0], [2.0], [40.0]]
+    kw.update(action_hidden=torch.randn(9, 17, 32), batch_indices=torch.arange(9),
+              interval_starts=torch.zeros(9, dtype=torch.long), task_names=tasks,
+              lava_absolute_starts=[0] * 9, same_episode_distance_ratios=ratios,
+              lava_episode_uids=[f'/{task}/episode{i}' for i, task in enumerate(tasks)])
+    _, info, captured = capture_objective(model, kw)
+    logits = captured['logits'].float()
+    wins = (logits[:, 0] > logits[:, 1]).float()
+    for name, rows in (('near', [0, 1, 7]), ('mid', [2, 3, 4]), ('far', [5, 6, 8])):
+        assert info[f'same_episode_acc_{name}'] == pytest.approx(wins[rows].mean().item())
+        assert info[f'same_episode_band_fraction_{name}'] == pytest.approx(1 / 3)

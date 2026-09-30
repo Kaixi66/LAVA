@@ -171,6 +171,7 @@ class ModelFactory:
             lava_batch_negative_reduction=config.training.get(
                 'lava_batch_negative_reduction', 'sum'),
             lava_num_cross_episode_negatives=int(config.training.get('lava_num_cross_episode_negatives', 4)),
+            lava_reuse_world_signatures=bool(config.training.get('lava_reuse_world_signatures', False)),
             lava_action_component_calibration=bool(config.training.get(
                 'lava_action_component_calibration', False)),
             lava_action_similarity_min_weight=float(config.training.get(
@@ -595,6 +596,16 @@ class VLAWrapper(nn.Module):
         if lava_weight is None:
             lava_weight = self.lambda_lava
 
+        same_episode_distance_ratios = None
+        if (self.use_lava and self.lava_negative_mode == 'episode_balanced'
+                and batch.get('same_episode_negative_starts') is not None):
+            same_episode_distance_ratios = [
+                [abs(int(start) - int(anchor)) / int(scale) for start in starts]
+                for starts, anchor, scale in zip(
+                    batch['same_episode_negative_starts'],
+                    batch['evolution_absolute_start'],
+                    batch['evolution_scales'].tolist())]
+
         # 5. Flow Matching Loss
         loss, info_dic = calc_flow_matching_loss(
             self.action_model,
@@ -621,6 +632,7 @@ class VLAWrapper(nn.Module):
             lava_context=lava_context,
             same_episode_negative_features=same_episode_features,
             lava_episode_uids=batch.get('evolution_episode_uid'),
+            lava_same_episode_distance_ratios=same_episode_distance_ratios,
             lava_absolute_starts=batch.get('evolution_absolute_start'),
             lava_interval_starts=batch.get('evolution_starts'),
             lava_interval_scales=batch.get('evolution_scales'),
@@ -640,6 +652,30 @@ class VLAWrapper(nn.Module):
             far_negative_raw_actions=far_negative_actions_raw,
         )
 
+        if (self.use_lava and self.lava_negative_mode == 'episode_balanced'
+                and batch.get('same_episode_negative_starts') is not None):
+            ratios = [abs(int(start) - int(anchor)) / int(scale)
+                      for starts, anchor, scale in zip(
+                          batch['same_episode_negative_starts'],
+                          batch['evolution_absolute_start'],
+                          batch['evolution_scales'].tolist())
+                      for start in starts]
+            if ratios:
+                info_dic['same_episode_distance_over_l'] = sum(ratios) / len(ratios)
+                info_dic['same_episode_distance_over_l_min'] = min(ratios)
+            sampling = [item for item in (batch.get('same_episode_sampling_info') or []) if item]
+            if sampling:
+                # near_filtered sampler: which band supplied the negative, how many
+                # behaviourally identical candidates were rejected first.
+                for index, name in enumerate(('near', 'mid', 'far')):
+                    info_dic[f'same_episode_sampled_{name}'] = sum(
+                        item['band'] == index for item in sampling) / len(sampling)
+                info_dic['same_episode_sampled_none'] = sum(item['band'] < 0 for item in sampling) / len(sampling)
+                info_dic['same_episode_rejected_fraction'] = (
+                    sum(item['rejected'] for item in sampling) / max(sum(item['checked'] for item in sampling), 1))
+                chosen = [item['action_rel'] for item in sampling if item['band'] >= 0]
+                if chosen:
+                    info_dic['same_episode_action_rel'] = sum(chosen) / len(chosen)
         if self.use_lava and self.lava_negative_mode in {'episode_local', 'mixed', 'mixed_batch'}:
             distances = batch.get('temporal_negative_distances')
             scales = batch.get('evolution_scales')

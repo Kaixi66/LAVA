@@ -157,7 +157,9 @@ class RobotWinTaskDataset(data.Dataset):
                  lava_negative_window_max=32,
                  lava_action_similarity_weighting=False,
                  lava_num_same_episode_negatives=4,
-                 lava_negative_exclusion_multiplier=2):
+                 lava_negative_exclusion_multiplier=2,
+                 lava_same_episode_sampling="uniform",
+                 lava_same_episode_action_min_rel=0.25):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -240,6 +242,17 @@ class RobotWinTaskDataset(data.Dataset):
             lava_action_similarity_weighting)
         self.lava_num_same_episode_negatives = int(lava_num_same_episode_negatives)
         self.lava_negative_exclusion_multiplier = int(lava_negative_exclusion_multiplier)
+        # "uniform": any same-scale start >= exclusion*L away (V6.4-V7.12).
+        # "near_filtered": prefer [2L,4L), then [4L,8L), then >=8L, accepting only
+        # starts whose joint-action increments differ from the positive's
+        # (relative distance >= lava_same_episode_action_min_rel).
+        self.lava_same_episode_sampling = str(lava_same_episode_sampling)
+        self.lava_same_episode_action_min_rel = float(lava_same_episode_action_min_rel)
+        if self.lava_same_episode_sampling not in {"uniform", "near_filtered"}:
+            raise ValueError("lava_same_episode_sampling must be uniform or near_filtered")
+        if self.lava_same_episode_sampling == "near_filtered" and self.lava_num_same_episode_negatives != 1:
+            raise ValueError("near_filtered same-episode sampling draws exactly one negative")
+        self._episode_action_cache = {}
         if self.lava_negative_mode == "episode_balanced":
             if not 0 <= self.lava_num_same_episode_negatives <= 4:
                 raise ValueError("episode_balanced requires 0..4 same-episode negatives")
@@ -495,6 +508,40 @@ class RobotWinTaskDataset(data.Dataset):
         candidates = [n for n in range(total_frames - scale)
                       if abs(n - positive_start) >= self.lava_negative_exclusion_multiplier * scale]
         return random.sample(candidates, min(self.lava_num_same_episode_negatives, len(candidates)))
+
+    SAME_EPISODE_BANDS = (("near", 2, 4), ("mid", 4, 8), ("far", 8, float("inf")))
+
+    def _episode_actions(self, hdf5_path):
+        actions = self._episode_action_cache.get(hdf5_path)
+        if actions is None:
+            with h5py.File(hdf5_path, 'r') as root:
+                actions = np.asarray(root['joint_action']['vector'][:], dtype=np.float32)
+            self._episode_action_cache[hdf5_path] = actions
+        return actions
+
+    @staticmethod
+    def _action_relation(actions, positive_start, start, scale):
+        positive = np.diff(actions[positive_start:positive_start + scale + 1], axis=0)
+        negative = np.diff(actions[start:start + scale + 1], axis=0)
+        denominator = np.linalg.norm(positive) + np.linalg.norm(negative)
+        return float(np.linalg.norm(positive - negative) / denominator) if denominator > 1e-9 else 0.0
+
+    def _sample_near_filtered_start(self, positive_start, scale, total_frames, hdf5_path):
+        """Nearest behaviourally different same-scale start; returns (starts, info)."""
+        actions = self._episode_actions(hdf5_path)
+        rejected = checked = 0
+        for band_index, (_, lo, hi) in enumerate(self.SAME_EPISODE_BANDS):
+            candidates = [n for n in range(total_frames - scale)
+                          if lo * scale <= abs(n - positive_start) < hi * scale]
+            random.shuffle(candidates)
+            for start in candidates:
+                checked += 1
+                relation = self._action_relation(actions, positive_start, start, scale)
+                if relation >= self.lava_same_episode_action_min_rel:
+                    return [start], {"band": band_index, "action_rel": relation,
+                                     "rejected": rejected, "checked": checked}
+                rejected += 1
+        return [], {"band": -1, "action_rel": float("nan"), "rejected": rejected, "checked": checked}
 
     def _sample_temporal_negative_start(self, positive_start, scale, total_frames):
         """Sample a same-scale, non-overlapping interval from the same episode."""
@@ -881,13 +928,17 @@ class RobotWinTaskDataset(data.Dataset):
                     local_anchor_idx + lava_start,
                     local_anchor_idx + lava_start + lava_scale + 1,
                 ))
-                if self.lava_negative_mode == "episode_balanced":
+                same_episode_info = None
+                if self.lava_negative_mode == "episode_balanced" and self.lava_same_episode_sampling == "near_filtered":
+                    same_episode_starts, same_episode_info = self._sample_near_filtered_start(
+                        local_anchor_idx + lava_start, lava_scale, total_frames, ep_meta['hdf5_path'])
+                elif self.lava_negative_mode == "episode_balanced":
                     same_episode_starts = self._sample_same_episode_starts(
                         local_anchor_idx + lava_start, lava_scale, total_frames)
-                    if same_episode_starts:
-                        query_indices['same_episode_frames'] = [
-                            frame for start in same_episode_starts
-                            for frame in range(start, start + lava_scale + 1)]
+                if self.lava_negative_mode == "episode_balanced" and same_episode_starts:
+                    query_indices['same_episode_frames'] = [
+                        frame for start in same_episode_starts
+                        for frame in range(start, start + lava_scale + 1)]
                 if lava_pair is not None:
                     negative_start = lava_pair['negative_abs_start']
                     query_indices['temporal_negative_frames'] = list(range(
@@ -980,6 +1031,8 @@ class RobotWinTaskDataset(data.Dataset):
                     result['evolution_absolute_start'] = int(local_anchor_idx + lava_start)
                     result['evolution_observation_start'] = int(local_anchor_idx)
                     result['same_episode_negative_starts'] = same_episode_starts
+                    if same_episode_info is not None:
+                        result['same_episode_sampling_info'] = same_episode_info
                     result['same_episode_negative_pixel_values'] = []
                     if same_episode_starts:
                         images = data_batch['same_episode_frames']
@@ -1094,6 +1147,8 @@ def create_dataset(config: Any, val: bool = False):
             'lava_action_similarity_weighting', False)),
         'lava_num_same_episode_negatives': int(config.training.get('lava_num_same_episode_negatives', 4)),
         'lava_negative_exclusion_multiplier': int(config.training.get('lava_negative_exclusion_multiplier', 2)),
+        'lava_same_episode_sampling': str(config.training.get('lava_same_episode_sampling', 'uniform')),
+        'lava_same_episode_action_min_rel': float(config.training.get('lava_same_episode_action_min_rel', 0.25)),
     }
 
     return RobotWinTaskDataset(**params)
@@ -1113,6 +1168,7 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         'temporal_negative_actions', 'far_negative_actions',
         'evolution_episode_uid', 'evolution_absolute_start', 'evolution_observation_start',
         'same_episode_negative_starts', 'same_episode_negative_pixel_values',
+        'same_episode_sampling_info',
     }
     keys = [key for key in batch[0].keys() if key not in lava_keys]
 
@@ -1138,6 +1194,8 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
             for key in ('evolution_episode_uid', 'evolution_absolute_start', 'evolution_observation_start',
                         'same_episode_negative_starts', 'same_episode_negative_pixel_values'):
                 result[key] = [sample[key] for _, sample in lava_samples]
+            result['same_episode_sampling_info'] = [
+                sample.get('same_episode_sampling_info') for _, sample in lava_samples]
         result['evolution_pixel_values'] = [
             sample['evolution_pixel_values'] for _, sample in lava_samples]
         temporal_negative_samples = [
