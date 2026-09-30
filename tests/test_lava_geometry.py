@@ -184,11 +184,34 @@ def test_factory_graded_options_and_unsupported_combinations():
     assert not any('ema_' in key for key in model.state_dict())
     restored = ModelFactory.create_action_model(config, 16, 1)
     restored.load_state_dict(model.state_dict(), strict=True)
-    for field, value in [('time_channel', True), ('world_encoding', 'feature_delta')]:
-        invalid = copy.deepcopy(config)
-        invalid.model.lava[field] = value
-        with pytest.raises(ValueError, match='state_delta'):
-            ModelFactory.create_action_model(invalid, 16, 1)
+    invalid = copy.deepcopy(config)
+    invalid.model.lava.world_encoding = 'feature_delta'
+    with pytest.raises(ValueError, match='state_delta'):
+        ModelFactory.create_action_model(invalid, 16, 1)
     config.model.lava.signature_normalization.rho = float('nan')
     with pytest.raises(ValueError, match='rho'):
         ModelFactory.create_action_model(config, 16, 1)
+
+
+def test_v64_restores_time_channel_on_stable_v63_geometry():
+    from models.model_runner import ModelFactory
+    config = OmegaConf.load(Path(__file__).parents[1] / 'configs/robotwin_lava_v64.yaml')
+    config.model.action_expert.hidden_size = 32
+    config.model.action_expert.depth = 1
+    config.model.action_expert.num_heads = 4
+    config.model.future_feat.enabled = False
+    model = ModelFactory.create_action_model(config, 16, 1).bfloat16()
+    assert model.lava_time_channel
+    assert model.lava_signature_normalization == 'graded_soft'
+    assert model.lava_signature_score == 'neg_l2'
+
+    kwargs = inputs((1, 2, 4))
+    kwargs['action_hidden'] = kwargs['action_hidden'].detach().bfloat16().requires_grad_()
+    kwargs['lava_context'] = kwargs['lava_context'].bfloat16()
+    kwargs['interval_starts'].zero_()
+    kwargs['order_negative'] = False
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        loss, _ = model.compute_lava_loss(**kwargs)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(kwargs['action_hidden'].grad).all()

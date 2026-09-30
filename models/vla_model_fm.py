@@ -286,6 +286,41 @@ def _raw_logsignature_levels(path_increments):
     return level_one, level_two
 
 
+def projected_logsignature_level_three(path_increments, projection):
+    """Exact degree-3 log-signature tensor after a fixed spatial projection.
+
+    The tensor coordinates are redundant (D**3 rather than the free-Lie
+    dimension), but retain every third-order cross-coordinate interaction.
+    The final path coordinate is the unprojected time channel.
+    """
+    if path_increments.ndim != 2 or path_increments.shape[1] != projection.shape[0] + 1:
+        raise ValueError("Projected level three expects spatial increments plus time")
+    with torch.autocast(device_type=path_increments.device.type, enabled=False):
+        spatial_projection = projection.float()
+        if projection.dtype == torch.int8:
+            spatial_projection = spatial_projection / math.sqrt(projection.shape[0])
+        spatial = path_increments[:, :-1].float() @ spatial_projection
+        increments = torch.cat((spatial, path_increments[:, -1:].float()), dim=-1)
+        d = increments.shape[-1]
+        one = increments.new_zeros(d)
+        two = increments.new_zeros(d, d)
+        three = increments.new_zeros(d, d, d)
+        for x in increments.unbind(0):
+            xx = torch.outer(x, x)
+            three = (three + torch.einsum("ij,k->ijk", two, x)
+                     + 0.5 * torch.einsum("i,jk->ijk", one, xx)
+                     + torch.einsum("i,jk->ijk", x, xx) / 6.0)
+            two = two + torch.outer(one, x) + 0.5 * xx
+            one = one + x
+        log_three = (three
+                     - 0.5 * (torch.einsum("i,jk->ijk", one, two)
+                              + torch.einsum("ij,k->ijk", two, one))
+                     + torch.einsum("i,j,k->ijk", one, one, one) / 3.0)
+        if increments.shape[0] == 1:
+            log_three = torch.zeros_like(log_three)
+        return log_three.reshape(-1)
+
+
 def graded_soft_logsignature(level_one, level_two, scale, depth=2, rho=1.0):
     """One differentiable path scale, with homogeneous scaling by level."""
     if not math.isfinite(rho) or rho <= 0:
@@ -807,6 +842,9 @@ class VLAModel(nn.Module):
                  lava_qformer_num_layers=2,
                  lava_qformer_num_heads=4,
                  lava_logsig_depth=2,
+                 lava_projected_third_order=False,
+                 lava_third_spatial_dim=31,
+                 lava_third_weight=1.0,
                  lava_action_target_layer="final",
                  lava_signature_normalization="ema_calibrated",
                  lava_scales=(1, 2, 4, 8, 16),
@@ -852,6 +890,28 @@ class VLAModel(nn.Module):
             raise ValueError("query_film requires state_delta world encoding")
         self.lava_residual_dim = lava_residual_dim
         self.lava_logsig_depth = lava_logsig_depth
+        self.lava_projected_third_order = bool(lava_projected_third_order)
+        self.lava_third_spatial_dim = int(lava_third_spatial_dim)
+        self.lava_third_weight = float(lava_third_weight)
+        if self.lava_projected_third_order:
+            if (self.lava_logsig_depth != 2 or not self.lava_time_channel
+                    or self.lava_world_encoding != "state_delta"):
+                raise ValueError("projected third order requires depth-2 state_delta with time channel")
+            if not 1 <= self.lava_third_spatial_dim <= lava_residual_dim:
+                raise ValueError("Invalid projected third-order spatial dimension")
+            if not math.isfinite(self.lava_third_weight) or self.lava_third_weight <= 0:
+                raise ValueError("Projected third-order weight must be finite and positive")
+            if lava_residual_dim & (lava_residual_dim - 1):
+                raise ValueError("Fixed third-order projection requires power-of-two residual dimension")
+            generator = torch.Generator(device="cpu").manual_seed(66408)
+            hadamard = torch.ones(1, 1, dtype=torch.int8)
+            while hadamard.shape[0] < lava_residual_dim:
+                hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1),
+                                      torch.cat((hadamard, -hadamard), dim=1)), dim=0)
+            row_order = torch.randperm(lava_residual_dim, generator=generator)
+            column_order = torch.randperm(lava_residual_dim, generator=generator)
+            projection = hadamard[row_order][:, column_order[:self.lava_third_spatial_dim]].contiguous()
+            self.register_buffer("lava_third_projection", projection, persistent=True)
         self.lava_signature_normalization = str(
             lava_signature_normalization).lower()
         self.lava_signature_rho = float(lava_signature_rho)
@@ -1186,6 +1246,12 @@ class VLAModel(nn.Module):
         world = torch.stack(world_signatures)
         positive_scores = lava_signature_score(action, world, self.lava_signature_score)
         rows, same_counts, cross_counts = [], [], []
+        base_rows = []
+        base_width = self.lava_residual_dim + int(self.lava_time_channel)
+        base_width += base_width * (base_width - 1) // 2
+        if self.lava_projected_third_order:
+            base_positive_scores = lava_signature_score(
+                action[:, :base_width], world[:, :base_width], self.lava_signature_score)
         state_mode = self.lava_world_encoding == "state_delta"
         for i, scale in enumerate(lengths):
             candidates = list(same_paths[i]) + [positive_paths[j] for j in cross_indices[i]]
@@ -1193,6 +1259,8 @@ class VLAModel(nn.Module):
             cross_counts.append(len(cross_indices[i]))
             if not candidates:
                 rows.append(positive_scores[i:i + 1])
+                if self.lava_projected_third_order:
+                    base_rows.append(base_positive_scores[i:i + 1])
                 continue
             path_length = scale + int(state_mode)
             if any(path.shape[0] != path_length for path in candidates):
@@ -1214,6 +1282,10 @@ class VLAModel(nn.Module):
                           if torch.is_grad_enabled() else encode_row(frames, context))
             negative_scores = lava_signature_score(action[i], signatures, self.lava_signature_score)
             rows.append(torch.cat((positive_scores[i:i + 1], negative_scores)))
+            if self.lava_projected_third_order:
+                base_negative_scores = lava_signature_score(
+                    action[i, :base_width], signatures[:, :base_width], self.lava_signature_score)
+                base_rows.append(torch.cat((base_positive_scores[i:i + 1], base_negative_scores)))
         width = max(map(len, rows))
         logits = torch.stack([F.pad(row, (0, width - len(row)), value=-torch.inf) for row in rows])
         same = torch.tensor(same_counts, device=action.device)
@@ -1270,6 +1342,29 @@ class VLAModel(nn.Module):
                 "lava_executed_path_ratio": ((interval_starts + torch.tensor(lengths, device=action.device))
                                              < execution_horizon).float().mean().item(),
             }
+            if self.lava_projected_third_order:
+                base_logits = torch.stack([
+                    F.pad(row, (0, width - len(row)), value=-torch.inf) for row in base_rows])
+                base_accuracy = (base_logits[valid].argmax(1) == 0).float()
+                diagnostics.update({
+                    "third_base_candidate_acc": base_accuracy.mean().item() if valid.any() else float("nan"),
+                    "third_candidate_acc_gain": (accuracy[valid].mean() - base_accuracy.mean()).item()
+                    if valid.any() else float("nan"),
+                    "third_positive_score_contribution": (positive_scores - base_positive_scores).mean().item(),
+                    "third_negative_score_contribution": mean(logits[:, 1:] - base_logits[:, 1:]),
+                    "third_action_raw_norm": mean(torch.stack([
+                        stats["level3_raw_norm"] for stats in action_calibration])),
+                    "third_world_raw_norm": mean(torch.stack([
+                        stats["level3_raw_norm"] for stats in world_calibration])),
+                    "third_action_calibrated_norm": mean(torch.stack([
+                        stats["level3_calibrated_norm"] for stats in action_calibration])),
+                    "third_world_calibrated_norm": mean(torch.stack([
+                        stats["level3_calibrated_norm"] for stats in world_calibration])),
+                    "third_action_energy_fraction": mean(torch.stack([
+                        stats["level3_energy_fraction"] for stats in action_calibration])),
+                    "third_world_energy_fraction": mean(torch.stack([
+                        stats["level3_energy_fraction"] for stats in world_calibration])),
+                })
             for modality, raw, calibrated, residuals in (
                     ("action", action_levels, action_calibration, action_residuals),
                     ("world", world_levels, world_calibration, world_residuals)):
@@ -1290,6 +1385,13 @@ class VLAModel(nn.Module):
                 diagnostics[f"loss_s{scale}"] = mean(losses, mask)
                 diagnostics[f"pos_sim_s{scale}"] = mean(positive_scores, mask)
                 diagnostics[f"candidate_acc_s{scale}"] = mean(accuracy, mask)
+                if self.lava_projected_third_order:
+                    action_third_energy = torch.stack([
+                        stats["level3_energy_fraction"] for stats in action_calibration])
+                    world_third_energy = torch.stack([
+                        stats["level3_energy_fraction"] for stats in world_calibration])
+                    diagnostics[f"third_action_energy_fraction_s{scale}"] = mean(action_third_energy, mask)
+                    diagnostics[f"third_world_energy_fraction_s{scale}"] = mean(world_third_energy, mask)
             for label, mask in (("executed", interval_starts + torch.tensor(lengths, device=action.device) < execution_horizon),
                                 ("tail", interval_starts + torch.tensor(lengths, device=action.device) >= execution_horizon)):
                 diagnostics[f"loss_lava_{label}"] = mean(losses, mask)
@@ -1506,6 +1608,8 @@ class VLAModel(nn.Module):
 
         action_raw_levels = []
         world_raw_levels = []
+        action_full_increments = []
+        world_full_increments = []
         action_level1_raw_norms = []
         action_level2_raw_norms = []
         world_level1_raw_norms = []
@@ -1526,6 +1630,8 @@ class VLAModel(nn.Module):
             time_channels.append(time_channel)
             action_increments = torch.cat((action_path, time_channel), dim=-1)
             world_increments = torch.cat((world_path, time_channel), dim=-1)
+            action_full_increments.append(action_increments)
+            world_full_increments.append(world_increments)
             action_levels = raw_signature_levels(action_increments)
             world_levels = raw_signature_levels(world_increments)
             action_raw_levels.append(action_levels)
@@ -1550,10 +1656,30 @@ class VLAModel(nn.Module):
             if isinstance(self.lava_signature_calibrator, EMASoftLogSignatureNormalizer)
             else None)
 
-        def build_signature(levels, modality, scale):
+        def build_signature(levels, modality, scale, increments=None):
             if self.lava_signature_normalization == "graded_soft":
-                return graded_soft_logsignature(
+                signature, stats = graded_soft_logsignature(
                     *levels, scale, depth=self.lava_logsig_depth, rho=self.lava_signature_rho)
+                if self.lava_projected_third_order:
+                    if increments is None:
+                        raise ValueError("Projected third order requires path increments")
+                    with torch.autocast(device_type=increments.device.type, enabled=False):
+                        delta, area = (level.float() for level in levels)
+                        s2 = (self.lava_signature_rho ** 4
+                              + delta.square().sum().square()
+                              + area.square().sum()).sqrt()
+                        raw_third = projected_logsignature_level_three(
+                            increments, self.lava_third_projection)
+                        calibrated_third = self.lava_third_weight * raw_third / s2.pow(1.5)
+                        signature = torch.cat((signature, calibrated_third))
+                        stats["level3_raw_norm"] = raw_third.detach().norm()
+                        stats["level3_calibrated_norm"] = calibrated_third.detach().norm()
+                        stats["level3_energy_fraction"] = (
+                            calibrated_third.detach().square().sum()
+                            / signature.detach().square().sum().clamp_min(1e-12))
+                return signature, stats
+            if self.lava_projected_third_order:
+                raise ValueError("Projected third order currently requires graded_soft")
             if soft_reference is not None:
                 return self.lava_signature_calibrator(
                     *levels, modality, scale, depth=self.lava_logsig_depth,
@@ -1589,21 +1715,22 @@ class VLAModel(nn.Module):
         world_signatures = []
         action_calibration = []
         world_calibration = []
-        for action_levels, world_levels, scale in zip(
-                action_raw_levels, world_raw_levels, lengths):
+        for action_levels, world_levels, action_increments, world_increments, scale in zip(
+                action_raw_levels, world_raw_levels, action_full_increments,
+                world_full_increments, lengths):
             action_signature, action_stats = build_signature(
-                action_levels, "action", scale)
+                action_levels, "action", scale, action_increments)
             world_signature, world_stats = build_signature(
-                world_levels, "world", scale)
+                world_levels, "world", scale, world_increments)
             action_signatures.append(action_signature)
             world_signatures.append(world_signature)
             action_calibration.append(action_stats)
             world_calibration.append(world_stats)
 
         def calibrated_world_signature(path, time_channel, scale):
-            levels = raw_signature_levels(
-                torch.cat((path, time_channel), dim=-1))
-            return build_signature(levels, "world", scale)[0]
+            increments = torch.cat((path, time_channel), dim=-1)
+            levels = raw_signature_levels(increments)
+            return build_signature(levels, "world", scale, increments)[0]
 
         if episode_balanced:
             return self._episode_balanced_objective(

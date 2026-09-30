@@ -1104,9 +1104,10 @@ def _small_tap_model(action_target_layer):
     )
 
 
-def test_block6_tap_preserves_full_policy_path_and_stops_lava_gradient():
+@pytest.mark.parametrize("tap_block", (6, 8))
+def test_intermediate_tap_preserves_full_policy_path_and_stops_lava_gradient(tap_block):
     torch.manual_seed(11)
-    layer6_model = _small_tap_model(6)
+    layer6_model = _small_tap_model(tap_block)
     final_model = _small_tap_model("final")
     final_model.load_state_dict(layer6_model.state_dict(), strict=True)
     inputs = {
@@ -1116,22 +1117,22 @@ def test_block6_tap_preserves_full_policy_path_and_stops_lava_gradient():
         "dino_features_list": [torch.randn(2, 5, 16)],
     }
     block_outputs = {}
-    handle = layer6_model.blocks[5].register_forward_hook(
-        lambda _module, _inputs, output: block_outputs.__setitem__("block6", output))
+    handle = layer6_model.blocks[tap_block - 1].register_forward_hook(
+        lambda _module, _inputs, output: block_outputs.__setitem__("tap", output))
     layer6_output = layer6_model(**inputs)
     handle.remove()
     final_output = final_model(**inputs)
 
     assert torch.allclose(
-        layer6_output["action_hidden"], block_outputs["block6"][:, :4])
+        layer6_output["action_hidden"], block_outputs["tap"][:, :4])
     assert torch.allclose(
         layer6_output["final_pred"], final_output["final_pred"], atol=1e-6)
     assert not torch.allclose(
         layer6_output["action_hidden"], layer6_output["final_action_hidden"])
 
     layer6_output["action_hidden"].square().mean().backward()
-    assert any(parameter.grad is not None for parameter in layer6_model.blocks[5].parameters())
-    assert all(parameter.grad is None for parameter in layer6_model.blocks[6].parameters())
+    assert any(parameter.grad is not None for parameter in layer6_model.blocks[tap_block - 1].parameters())
+    assert all(parameter.grad is None for parameter in layer6_model.blocks[tap_block].parameters())
     assert all(parameter.grad is None for parameter in layer6_model.blocks[11].parameters())
 
 

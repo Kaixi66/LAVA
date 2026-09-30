@@ -1,0 +1,72 @@
+common:
+  action_dim: 7
+  state_dim: 8
+  action_chunk_size: 12
+  proprio_len: 1
+  num_inference_steps: 10
+  action_execution_horizon: 8
+
+dataset:
+  type: libero
+  norm_stats_key: libero
+  dataset_dir: /fs/cml-projects/WAM/data/libero/libero_spatial
+  camera_names: [agentview_rgb, eye_in_hand_rgb]
+  image_size: [256, 256]
+  task_cond_dir: /fs/cml-projects/WAM/data/libero_processed/libero_spatial/vtt
+  image_aug: false
+  future_frame_offset: 12
+  indices_config:
+    state_indices: [0]
+    camera_indices: [0]
+    action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+model:
+  num_registers: 2
+  use_task_cond: true
+  vision_encoder:
+    checkpoint_path: /fs/cml-projects/WAM/data/models/dinov3-vitl16-pretrain-lvd1689m
+    feat_layers: [-8, -4]
+    include_cls_register: true
+    encode_batch_size: 16
+    fusion_mode: concat
+    concat:
+      proj_type: linear
+      pre_norm: true
+      out_dim: null
+  future_feat:
+    enabled: true
+    target_layer: -4
+    num_decoder_layers: 4
+    num_heads: 4
+  action_expert:
+    depth: 12
+    hidden_size: 768
+    num_heads: 8
+    vlm_adapter_num_queries: 64
+    adapter_depth: 4
+
+training:
+  batch_size: 128
+  time_sampler: logit_normal
+  time_mu: 0.0
+  time_sigma: 1.0
+  learning_rate: 2e-4
+  lr_min: 5e-5
+  weight_decay: 1e-2
+  betas: [0.9, 0.99]
+  grad_clip_norm: 1.0
+  epochs: 12
+  grad_accum_steps: 1
+  save_interval_epoch: 1
+  lambda_future_feat: 0.5
+  use_vel_weight: false
+  vel_weight_alpha: 0.2
+  vel_weight_sigma: 0.01
+
+inference:
+  smooth_actions: false
+  smooth_sigma: 1.0
+
+system:
+  num_workers: 8
+  pin_memory: true
