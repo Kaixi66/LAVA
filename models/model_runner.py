@@ -520,7 +520,10 @@ class VLAWrapper(nn.Module):
                 negative_groups = batch.get('same_episode_negative_pixel_values')
                 if negative_groups is None or len(negative_groups) != len(positive_paths):
                     raise ValueError('episode_balanced requires one ragged negative list per positive')
-                extensions = batch.get('cross_scale_extension_pixel_values') or []
+                # collate_fn always emits this key (all None when cross-scale is off);
+                # only treat it as input when the sampler actually enabled "extend".
+                extend_enabled = any('extend' in (item or {}) for item in batch.get('cross_scale_status') or [])
+                extensions = (batch.get('cross_scale_extension_pixel_values') or []) if extend_enabled else []
                 extension_paths = [path for path in extensions if path is not None]
                 all_features = extract_features(
                     positive_paths + [path for group in negative_groups for path in group] + extension_paths)
