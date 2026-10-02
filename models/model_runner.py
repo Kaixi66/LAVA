@@ -505,6 +505,7 @@ class VLAWrapper(nn.Module):
         local_features = None
         far_features = None
         same_episode_features = None
+        cross_scale_extension_features = None
         temporal_negative_actions_raw = None
         temporal_negative_actions_normalized = None
         far_negative_actions_raw = None
@@ -519,7 +520,17 @@ class VLAWrapper(nn.Module):
                 negative_groups = batch.get('same_episode_negative_pixel_values')
                 if negative_groups is None or len(negative_groups) != len(positive_paths):
                     raise ValueError('episode_balanced requires one ragged negative list per positive')
-                all_features = extract_features(positive_paths + [path for group in negative_groups for path in group])
+                extensions = batch.get('cross_scale_extension_pixel_values') or []
+                extension_paths = [path for path in extensions if path is not None]
+                all_features = extract_features(
+                    positive_paths + [path for group in negative_groups for path in group] + extension_paths)
+                if extension_paths:
+                    extension_iter = iter(all_features[len(all_features) - len(extension_paths):])
+                    cross_scale_extension_features = [
+                        next(extension_iter) if path is not None else None for path in extensions]
+                    all_features = all_features[:len(all_features) - len(extension_paths)]
+                elif extensions:
+                    cross_scale_extension_features = [None] * len(extensions)
                 world_features = all_features[:len(positive_paths)]
                 same_episode_features = []
                 offset = len(positive_paths)
@@ -633,6 +644,11 @@ class VLAWrapper(nn.Module):
             same_episode_negative_features=same_episode_features,
             lava_episode_uids=batch.get('evolution_episode_uid'),
             lava_same_episode_distance_ratios=same_episode_distance_ratios,
+            lava_cross_scale_extension_features=cross_scale_extension_features,
+            lava_cross_scale_prefix_valid=(batch.get('cross_scale_prefix_valid')
+                                           if batch.get('cross_scale_status') and any(batch['cross_scale_status'])
+                                           and any('prefix' in (item or {}) for item in batch['cross_scale_status'])
+                                           else None),
             lava_absolute_starts=batch.get('evolution_absolute_start'),
             lava_interval_starts=batch.get('evolution_starts'),
             lava_interval_scales=batch.get('evolution_scales'),
@@ -663,6 +679,12 @@ class VLAWrapper(nn.Module):
             if ratios:
                 info_dic['same_episode_distance_over_l'] = sum(ratios) / len(ratios)
                 info_dic['same_episode_distance_over_l_min'] = min(ratios)
+            statuses = [item for item in (batch.get('cross_scale_status') or []) if item]
+            for variant in ('extend', 'prefix'):
+                values = [item[variant] for item in statuses if variant in item]
+                for reason in ('ok', 'static', 'boundary', 'too_short'):
+                    if values:
+                        info_dic[f'cross_scale_{variant}_{reason}'] = sum(v == reason for v in values) / len(values)
             sampling = [item for item in (batch.get('same_episode_sampling_info') or []) if item]
             if sampling:
                 # near_filtered sampler: which band supplied the negative, how many

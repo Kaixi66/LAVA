@@ -430,3 +430,134 @@ def test_band_accuracy_diagnostics_match_logits():
     for name, rows in (('near', [0, 1, 7]), ('mid', [2, 3, 4]), ('far', [5, 6, 8])):
         assert info[f'same_episode_acc_{name}'] == pytest.approx(wins[rows].mean().item())
         assert info[f'same_episode_band_fraction_{name}'] == pytest.approx(1 / 3)
+
+
+def cross_scale_dataset(root, variants=('extend', 'prefix')):
+    from dataloader.dataset import RobotWinTaskDataset
+    return RobotWinTaskDataset(root,
+        indices_config=dict(state_indices=[0], action_indices=list(range(32)), camera_indices=[0]),
+        camera_names=['head_camera'], image_size=(16, 16), task_set='all',
+        use_lava=True, lava_sample_ratio=1., lava_negative_mode='episode_balanced',
+        lava_num_same_episode_negatives=1, lava_cross_scale_negatives=variants)
+
+
+def test_cross_scale_status_filters_static_and_boundary(episode_root):
+    dataset = cross_scale_dataset(episode_root)
+    path = dataset.episode_metadata[0]['hdf5_path']
+    actions = np.random.default_rng(1).normal(size=(128, 14)).astype('float32')
+    actions[40:] = actions[40]  # static from frame 40 on
+    dataset._episode_action_cache[path] = actions
+    assert dataset._cross_scale_status(10, 4, 128, path) == {'extend': 'ok', 'prefix': 'ok'}
+    assert dataset._cross_scale_status(32, 8, 128, path)['extend'] == 'static'   # [40,48] static
+    assert dataset._cross_scale_status(36, 8, 128, path)['prefix'] == 'static'   # [40,44] static
+    assert dataset._cross_scale_status(110, 16, 128, path)['extend'] == 'boundary'
+    assert dataset._cross_scale_status(10, 1, 128, path)['prefix'] == 'too_short'
+
+
+@pytest.mark.parametrize('scale', [1, 2, 4, 8, 16])
+def test_cross_scale_sample_loads_exactly_the_extension_frames(episode_root, scale, monkeypatch):
+    dataset = cross_scale_dataset(episode_root)
+    monkeypatch.setattr(dataset, '_sample_lava_interval', lambda *a, **kw: (3, scale))
+    sample = dataset[(0, scale)]
+    status = sample['cross_scale_status']
+    assert set(status) == {'extend', 'prefix'}
+    assert sample['cross_scale_prefix_valid'] == (status['prefix'] == 'ok')
+    extension = sample['cross_scale_extension_pixel_values']
+    if status['extend'] == 'ok':
+        assert extension.shape == (scale, 3, 16, 16)
+        # The extension continues the positive: frame t+L+1 onward.
+        start = sample['evolution_absolute_start']
+        longer = dataset._load_hdf5_data(dataset.episode_metadata[0]['hdf5_path'], {
+            'action': [0], 'state': [0], 'head_camera': [0],
+            'evolution_frames': list(range(start, start + 2 * scale + 1))})['evolution_frames']
+        expected = np.stack([module_normalize(img) for img in longer[scale + 1:]])
+        torch.testing.assert_close(extension, torch.from_numpy(expected).float())
+    else:
+        assert extension is None
+    batch = collate_fn([sample, sample])
+    assert len(batch['cross_scale_extension_pixel_values']) == 2 and len(batch['cross_scale_status']) == 2
+
+
+def module_normalize(img):
+    from dataloader.dataset import _normalize_image
+    return _normalize_image(img)
+
+
+def capture_cross_scale(model, kwargs):
+    captured = {}
+    code = model._episode_balanced_objective.__func__.__code__
+    previous = sys.getprofile()
+    def profile(frame, event, arg):
+        if event == 'return' and frame.f_code is code:
+            for key in ('logits', 'world', 'extend_signatures', 'prefix_signatures', 'same_counts', 'cross_counts'):
+                captured[key] = frame.f_locals[key]
+    try:
+        sys.setprofile(profile)
+        loss, info = model.compute_lava_loss(**kwargs)
+    finally:
+        sys.setprofile(previous)
+    return loss, info, captured
+
+
+def test_cross_scale_signatures_equal_direct_encoding_and_carry_gradients():
+    torch.manual_seed(714)
+    model = v712_model(True)
+    scale, n = 4, 9
+    tasks = ['task_a'] * 5 + ['task_b'] * 4
+    kw = balanced_inputs((scale,) * n, (1,) * n)
+    kw.pop('lava_context')
+    extensions = [torch.randn(scale, 5, 16) if i % 3 != 2 else None for i in range(n)]
+    prefix_valid = [i % 4 != 3 for i in range(n)]
+    kw.update(action_hidden=torch.randn(n, 17, 32, requires_grad=True), batch_indices=torch.arange(n),
+              interval_starts=torch.zeros(n, dtype=torch.long), task_names=tasks, lava_absolute_starts=[0] * n,
+              lava_episode_uids=[f'/{task}/episode{i}' for i, task in enumerate(tasks)],
+              cross_scale_extension_features=extensions, cross_scale_prefix_valid=prefix_valid)
+    loss, info, cap = capture_cross_scale(model, kw)
+    has_ext = torch.tensor([e is not None for e in extensions])
+    has_pre = torch.tensor(prefix_valid)
+    widths = 1 + torch.tensor(cap['same_counts']) + torch.tensor(cap['cross_counts']) + has_ext.long() + has_pre.long()
+    assert torch.isfinite(cap['logits']).sum(1).tolist() == widths.tolist()
+    assert info['cross_scale_extend_availability'] == pytest.approx(has_ext.float().mean().item())
+    assert info['cross_scale_prefix_availability'] == pytest.approx(has_pre.float().mean().item())
+    # Direct encoding: treat the extended / prefix path as the positive of that scale.
+    for variant, new_scale in (('extend', 2 * scale), ('prefix', scale // 2)):
+        # Anchors without an extension get placeholder frames; they are not compared.
+        paths = [torch.cat((p, e if e is not None else torch.zeros_like(p[1:]))) if variant == 'extend'
+                 else p[:new_scale + 1] for p, e in zip(kw['world_feature_paths'], extensions)]
+        direct = dict(kw, world_feature_paths=paths, interval_scales=torch.full((n,), new_scale),
+                      cross_scale_extension_features=None, cross_scale_prefix_valid=None,
+                      same_episode_negative_features=[[] for _ in range(n)])
+        with torch.no_grad():
+            ref = capture_objective_world(model, direct)
+        own = cap['extend_signatures'] if variant == 'extend' else cap['prefix_signatures']
+        for i in range(n):
+            if own[i] is not None:
+                torch.testing.assert_close(own[i].detach(), ref[i], rtol=1e-5, atol=1e-6)
+    loss.backward()
+    for name, parameter in model.lava_world_encoder.named_parameters():
+        if parameter.requires_grad and 'film' not in name:
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
+def capture_objective_world(model, kwargs):
+    captured = {}
+    code = model._episode_balanced_objective.__func__.__code__
+    previous = sys.getprofile()
+    def profile(frame, event, arg):
+        if event == 'return' and frame.f_code is code:
+            captured['world'] = frame.f_locals['world'].detach()
+    try:
+        sys.setprofile(profile)
+        model.compute_lava_loss(**kwargs)
+    finally:
+        sys.setprofile(previous)
+    return captured['world']
+
+
+def test_cross_scale_requires_reused_signatures():
+    model = v712_model(False)
+    kw = balanced_inputs((4,) * 3, (1,) * 3)
+    kw.pop('lava_context')
+    kw['cross_scale_prefix_valid'] = [True] * 3
+    with pytest.raises(ValueError, match='reused world signatures'):
+        model.compute_lava_loss(**kw)

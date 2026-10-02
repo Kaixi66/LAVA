@@ -159,7 +159,9 @@ class RobotWinTaskDataset(data.Dataset):
                  lava_num_same_episode_negatives=4,
                  lava_negative_exclusion_multiplier=2,
                  lava_same_episode_sampling="uniform",
-                 lava_same_episode_action_min_rel=0.25):
+                 lava_same_episode_action_min_rel=0.25,
+                 lava_cross_scale_negatives=(),
+                 lava_cross_scale_min_motion=0.25):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -253,6 +255,15 @@ class RobotWinTaskDataset(data.Dataset):
         if self.lava_same_episode_sampling == "near_filtered" and self.lava_num_same_episode_negatives != 1:
             raise ValueError("near_filtered same-episode sampling draws exactly one negative")
         self._episode_action_cache = {}
+        # Same-start, wrong-duration world paths: "extend" [t, t+2L] and "prefix"
+        # [t, t+L/2]. Each is used only when the non-shared part of the window
+        # really moves (joint-action path length >= min_motion x shared part).
+        self.lava_cross_scale_negatives = tuple(lava_cross_scale_negatives or ())
+        self.lava_cross_scale_min_motion = float(lava_cross_scale_min_motion)
+        if not set(self.lava_cross_scale_negatives) <= {"extend", "prefix"}:
+            raise ValueError("lava_cross_scale_negatives must be a subset of {extend, prefix}")
+        if self.lava_cross_scale_negatives and self.lava_negative_mode != "episode_balanced":
+            raise ValueError("cross-scale negatives require episode_balanced")
         if self.lava_negative_mode == "episode_balanced":
             if not 0 <= self.lava_num_same_episode_negatives <= 4:
                 raise ValueError("episode_balanced requires 0..4 same-episode negatives")
@@ -525,6 +536,34 @@ class RobotWinTaskDataset(data.Dataset):
         negative = np.diff(actions[start:start + scale + 1], axis=0)
         denominator = np.linalg.norm(positive) + np.linalg.norm(negative)
         return float(np.linalg.norm(positive - negative) / denominator) if denominator > 1e-9 else 0.0
+
+    CROSS_SCALE_MIN_PATH = 1e-3  # joint-action path length below which a segment is static
+
+    def _cross_scale_status(self, positive_start, scale, total_frames, hdf5_path):
+        """Return {variant: "ok" | "static" | "boundary" | "too_short"} for enabled variants."""
+        if not self.lava_cross_scale_negatives:
+            return {}
+        actions = self._episode_actions(hdf5_path)
+
+        def path_length(start, end):
+            return float(np.linalg.norm(np.diff(actions[start:end + 1], axis=0), axis=1).sum())
+
+        def judge(shared, extra):
+            return "ok" if (extra > self.CROSS_SCALE_MIN_PATH
+                            and extra >= self.lava_cross_scale_min_motion * shared) else "static"
+
+        status = {}
+        if "extend" in self.lava_cross_scale_negatives:
+            end = positive_start + 2 * scale
+            status["extend"] = ("boundary" if end >= total_frames else judge(
+                path_length(positive_start, positive_start + scale),
+                path_length(positive_start + scale, end)))
+        if "prefix" in self.lava_cross_scale_negatives:
+            half = scale // 2
+            status["prefix"] = ("too_short" if scale < 2 else judge(
+                path_length(positive_start, positive_start + half),
+                path_length(positive_start + half, positive_start + scale)))
+        return status
 
     def _sample_near_filtered_start(self, positive_start, scale, total_frames, hdf5_path):
         """Nearest behaviourally different same-scale start; returns (starts, info)."""
@@ -835,7 +874,8 @@ class RobotWinTaskDataset(data.Dataset):
             evolution_keys = [
                 key for key in (
                     'evolution_frames', 'temporal_negative_frames',
-                    'far_negative_frames', 'same_episode_frames')
+                    'far_negative_frames', 'same_episode_frames',
+                    'cross_scale_extension_frames')
                 if key in query_indices
             ]
             if self.use_lava and evolution_keys:
@@ -935,6 +975,13 @@ class RobotWinTaskDataset(data.Dataset):
                 elif self.lava_negative_mode == "episode_balanced":
                     same_episode_starts = self._sample_same_episode_starts(
                         local_anchor_idx + lava_start, lava_scale, total_frames)
+                cross_scale_status = self._cross_scale_status(
+                    local_anchor_idx + lava_start, lava_scale, total_frames, ep_meta['hdf5_path'])
+                if cross_scale_status.get("extend") == "ok":
+                    # Only the L frames after the positive; the positive frames are reused.
+                    query_indices['cross_scale_extension_frames'] = list(range(
+                        local_anchor_idx + lava_start + lava_scale + 1,
+                        local_anchor_idx + lava_start + 2 * lava_scale + 1))
                 if self.lava_negative_mode == "episode_balanced" and same_episode_starts:
                     query_indices['same_episode_frames'] = [
                         frame for start in same_episode_starts
@@ -967,7 +1014,8 @@ class RobotWinTaskDataset(data.Dataset):
                 ]
 
             data_batch = self._load_hdf5_data(ep_meta['hdf5_path'], query_indices)
-            for key in ('evolution_frames', 'temporal_negative_frames', 'far_negative_frames', 'same_episode_frames'):
+            for key in ('evolution_frames', 'temporal_negative_frames', 'far_negative_frames', 'same_episode_frames',
+                        'cross_scale_extension_frames'):
                 if key in query_indices and key not in data_batch:
                     raise KeyError(f'Requested LAVA frames missing from loader: {key}')
             data_batch.update(padding_mask)
@@ -1033,6 +1081,13 @@ class RobotWinTaskDataset(data.Dataset):
                     result['same_episode_negative_starts'] = same_episode_starts
                     if same_episode_info is not None:
                         result['same_episode_sampling_info'] = same_episode_info
+                    if cross_scale_status:
+                        result['cross_scale_status'] = cross_scale_status
+                        result['cross_scale_prefix_valid'] = cross_scale_status.get("prefix") == "ok"
+                        result['cross_scale_extension_pixel_values'] = None
+                        if 'cross_scale_extension_frames' in data_batch:
+                            result['cross_scale_extension_pixel_values'] = torch.from_numpy(np.stack([
+                                _normalize_image(img) for img in data_batch['cross_scale_extension_frames']])).float()
                     result['same_episode_negative_pixel_values'] = []
                     if same_episode_starts:
                         images = data_batch['same_episode_frames']
@@ -1149,6 +1204,8 @@ def create_dataset(config: Any, val: bool = False):
         'lava_negative_exclusion_multiplier': int(config.training.get('lava_negative_exclusion_multiplier', 2)),
         'lava_same_episode_sampling': str(config.training.get('lava_same_episode_sampling', 'uniform')),
         'lava_same_episode_action_min_rel': float(config.training.get('lava_same_episode_action_min_rel', 0.25)),
+        'lava_cross_scale_negatives': tuple(config.training.get('lava_cross_scale_negatives', ()) or ()),
+        'lava_cross_scale_min_motion': float(config.training.get('lava_cross_scale_min_motion', 0.25)),
     }
 
     return RobotWinTaskDataset(**params)
@@ -1169,6 +1226,7 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         'evolution_episode_uid', 'evolution_absolute_start', 'evolution_observation_start',
         'same_episode_negative_starts', 'same_episode_negative_pixel_values',
         'same_episode_sampling_info',
+        'cross_scale_status', 'cross_scale_prefix_valid', 'cross_scale_extension_pixel_values',
     }
     keys = [key for key in batch[0].keys() if key not in lava_keys]
 
@@ -1196,6 +1254,8 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
                 result[key] = [sample[key] for _, sample in lava_samples]
             result['same_episode_sampling_info'] = [
                 sample.get('same_episode_sampling_info') for _, sample in lava_samples]
+            for key in ('cross_scale_status', 'cross_scale_prefix_valid', 'cross_scale_extension_pixel_values'):
+                result[key] = [sample.get(key) for _, sample in lava_samples]
         result['evolution_pixel_values'] = [
             sample['evolution_pixel_values'] for _, sample in lava_samples]
         temporal_negative_samples = [

@@ -1238,8 +1238,15 @@ class VLAModel(nn.Module):
             time_channels, build_world_signature, action_levels, world_levels,
             action_calibration, world_calibration, action_residuals, world_residuals,
             interval_starts, execution_horizon, endpoint_error, soft_reference, temperature,
-            anchor_task_names=None, same_distance_ratios=None):
-        """Independent 0..4 same-episode + 0..4 cross-episode candidate logits."""
+            anchor_task_names=None, same_distance_ratios=None,
+            cross_scale_extensions=None, cross_scale_prefix_valid=None):
+        """Independent 0..4 same-episode + 0..4 cross-episode candidate logits.
+
+        Optional cross-scale candidates share the anchor's start but not its duration:
+        extend = frames [t, t+2L] (positive DINO frames + the L extension frames),
+        prefix = the positive's first L/2 learned increments. Each is signed at its own
+        scale (time channel 1/L') and appended after the cross-episode columns.
+        """
         count = len(positive_paths)
         if same_paths is None or len(same_paths) != count:
             raise ValueError("episode_balanced requires a ragged same-episode list per anchor")
@@ -1278,11 +1285,44 @@ class VLAModel(nn.Module):
                 for i, path in zip(owners, states.split([path.shape[0] for path in same_flat])):
                     same_signatures[i].append(build_world_signature(
                         path[1:] - path[:-1] if state_mode else path, time_channels[i], lengths[i]))
+        extend_signatures, prefix_signatures = [None] * count, [None] * count
+        if cross_scale_extensions is not None or cross_scale_prefix_valid is not None:
+            if not (reuse and state_mode):
+                raise ValueError("cross-scale negatives require state_delta and reused world signatures")
+
+            def time_channel(steps):
+                return torch.full((steps, int(self.lava_time_channel)), 1.0 / steps,
+                                  device=action.device, dtype=world_residuals[0].dtype)
+            if cross_scale_extensions is not None:
+                if len(cross_scale_extensions) != count:
+                    raise ValueError("cross-scale extensions must align with LAVA anchors")
+                owners = [i for i, path in enumerate(cross_scale_extensions) if path is not None]
+                if owners:
+                    full = [torch.cat((positive_paths[i], cross_scale_extensions[i].to(
+                        device=positive_paths[i].device, dtype=positive_paths[i].dtype))) for i in owners]
+                    if any(path.shape[0] != 2 * lengths[i] + 1 for i, path in zip(owners, full)):
+                        raise ValueError("cross-scale extension must add exactly L frames")
+                    states = self.lava_world_encoder(torch.cat(full))
+                    for i, path in zip(owners, states.split([path.shape[0] for path in full])):
+                        extend_signatures[i] = build_world_signature(
+                            path[1:] - path[:-1], time_channel(2 * lengths[i]), 2 * lengths[i])
+            if cross_scale_prefix_valid is not None:
+                if len(cross_scale_prefix_valid) != count:
+                    raise ValueError("cross-scale prefix flags must align with LAVA anchors")
+                for i, ok in enumerate(cross_scale_prefix_valid):
+                    if ok and lengths[i] >= 2:
+                        half = lengths[i] // 2
+                        prefix_signatures[i] = build_world_signature(
+                            world_residuals[i][:half], time_channel(half), half)
+        extend_counts, prefix_counts = [], []
         for i, scale in enumerate(lengths):
             candidates = list(same_paths[i]) + [positive_paths[j] for j in cross_indices[i]]
             same_counts.append(len(same_paths[i]))
             cross_counts.append(len(cross_indices[i]))
-            if not candidates:
+            extras = [sig for sig in (extend_signatures[i], prefix_signatures[i]) if sig is not None]
+            extend_counts.append(int(extend_signatures[i] is not None))
+            prefix_counts.append(int(prefix_signatures[i] is not None))
+            if not candidates and not extras:
                 rows.append(positive_scores[i:i + 1])
                 if self.lava_projected_third_order:
                     base_rows.append(base_positive_scores[i:i + 1])
@@ -1291,7 +1331,7 @@ class VLAModel(nn.Module):
             if any(path.shape[0] != path_length for path in candidates):
                 raise ValueError("episode_balanced candidate length does not match anchor scale")
             if reuse:
-                signatures = torch.stack(same_signatures[i] + [world[j] for j in cross_indices[i]])
+                signatures = torch.stack(same_signatures[i] + [world[j] for j in cross_indices[i]] + extras)
             else:
                 frames = torch.cat([path.to(device=action.device, dtype=positive_paths[i].dtype)
                                     for path in candidates])
@@ -1318,7 +1358,9 @@ class VLAModel(nn.Module):
         logits = torch.stack([F.pad(row, (0, width - len(row)), value=-torch.inf) for row in rows])
         same = torch.tensor(same_counts, device=action.device)
         cross = torch.tensor(cross_counts, device=action.device)
-        valid = (same + cross) > 0
+        extend = torch.tensor(extend_counts, device=action.device)
+        prefix = torch.tensor(prefix_counts, device=action.device)
+        valid = (same + cross + extend + prefix) > 0
         losses = torch.full_like(positive_scores, float("nan"))
         accuracy = torch.full_like(positive_scores, float("nan"))
         if valid.any():
@@ -1476,6 +1518,19 @@ class VLAModel(nn.Module):
                             for k, ratio in enumerate(ratios[:int(same[i])]) if lo <= ratio < hi]
                     diagnostics[f"same_episode_acc_{name}"] = sum(hits) / len(hits) if hits else float("nan")
                     diagnostics[f"same_episode_band_fraction_{name}"] = len(hits) / max(int(same.sum()), 1)
+            if cross_scale_extensions is not None or cross_scale_prefix_valid is not None:
+                rows_index = torch.arange(count, device=action.device)
+                for name, has, column in (("extend", extend > 0, 1 + same + cross),
+                                          ("prefix", prefix > 0, 1 + same + cross + extend)):
+                    variant = scores[rows_index, column.clamp_max(width - 1)]
+                    diagnostics[f"cross_scale_{name}_availability"] = has.float().mean().item()
+                    diagnostics[f"cross_scale_{name}_acc"] = mean((positive > variant).float(), has)
+                    diagnostics[f"cross_scale_{name}_hardest"] = mean((variant > max_cross).float(), has & has_cross)
+                    diagnostics[f"cross_scale_{name}_probability"] = mean(
+                        probability[rows_index, column.clamp_max(width - 1)], has)
+                    for scale in (1, 2, 4, 8, 16):
+                        diagnostics[f"cross_scale_{name}_acc_s{scale}"] = mean(
+                            (positive > variant).float(), has & (lengths_tensor == scale))
             if anchor_task_names is not None:
                 # Same-task cross-episode candidates need dynamics; cross-task ones can be
                 # separated by task/scene identity alone.
@@ -1532,7 +1587,8 @@ class VLAModel(nn.Module):
                           lava_context=None,
                           same_episode_negative_features=None,
                           lava_episode_uids=None, lava_absolute_starts=None,
-                          same_episode_distance_ratios=None):
+                          same_episode_distance_ratios=None,
+                          cross_scale_extension_features=None, cross_scale_prefix_valid=None):
         """Compute one-way action-to-world InfoNCE for sampled intervals."""
         if not self.use_lava:
             raise RuntimeError("compute_lava_loss called while LAVA is disabled")
@@ -1845,7 +1901,9 @@ class VLAModel(nn.Module):
                 action_execution_horizon, state_endpoint_error, soft_reference, temperature,
                 anchor_task_names=(None if task_names is None else
                                    [task_names[index] for index in batch_indices.tolist()]),
-                same_distance_ratios=same_episode_distance_ratios)
+                same_distance_ratios=same_episode_distance_ratios,
+                cross_scale_extensions=cross_scale_extension_features,
+                cross_scale_prefix_valid=cross_scale_prefix_valid)
 
         temporal_negative_signatures = []
         far_negative_signatures = []
@@ -3022,6 +3080,8 @@ def calc_flow_matching_loss(
     lava_episode_uids=None,
     lava_absolute_starts=None,
     lava_same_episode_distance_ratios=None,
+    lava_cross_scale_extension_features=None,
+    lava_cross_scale_prefix_valid=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -3143,6 +3203,8 @@ def calc_flow_matching_loss(
             lava_episode_uids=lava_episode_uids,
             lava_absolute_starts=lava_absolute_starts,
             same_episode_distance_ratios=lava_same_episode_distance_ratios,
+            cross_scale_extension_features=lava_cross_scale_extension_features,
+            cross_scale_prefix_valid=lava_cross_scale_prefix_valid,
             world_feature_paths=world_feature_paths,
             temporal_negative_feature_paths=temporal_negative_feature_paths,
             far_negative_feature_paths=far_negative_feature_paths,

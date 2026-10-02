@@ -64,6 +64,12 @@ EB_FAMILY_METRICS = (
       for band in ("near", "mid", "far", "none")),
     ("Same_Episode_Rejected_Fraction", "same_episode_rejected_fraction"),
     ("Same_Episode_Action_Rel", "same_episode_action_rel"),
+    *((f"Cross_Scale_{variant.capitalize()}_{name}", f"cross_scale_{variant}_{key}")
+      for variant in ("extend", "prefix")
+      for name, key in (("Availability", "availability"), ("Acc", "acc"), ("Hardest", "hardest"),
+                        ("Probability", "probability"), ("Ok", "ok"), ("Static", "static"),
+                        ("Boundary", "boundary"), ("Too_Short", "too_short"),
+                        *((f"Acc_S{scale}", f"acc_s{scale}") for scale in (1, 2, 4, 8, 16)))),
     *((f"{name}_S{scale}", f"{key}_s{scale}") for scale in (1, 2, 4, 8, 16)
       for name, key in (("Same_Episode_Mass_Fraction", "same_episode_mass_fraction"),
                         ("Hardest_Is_Same_Episode", "hardest_is_same_episode"),
